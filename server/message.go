@@ -38,11 +38,13 @@ func nowMicro() int64 {
 // netRTT = clientRTT - serverProc で純粋なネットワーク往復を分離できるようにする。
 func process(in *Envelope) *Envelope {
 	in.ServerRecv = nowMicro()
+	statMsgProcessed.Add(1)
 
 	switch in.Type {
-	case "echo", "player.move":
+	case "echo", "player.move", "echo.size":
 		// 純粋なリレー（中継）。サーバーはほぼ何もしない。
 		// player.move は「他プレイヤーへ転送するだけ」のクライアント権威モデルを想定。
+		// echo.size はクライアント指定サイズのpayloadをそのまま返す（上り+下り帯域計測）。
 
 	case "ball.kick":
 		// サーバー権威でボール物理を計算する場合に走る処理を擬似再現。
@@ -51,6 +53,27 @@ func process(in *Envelope) *Envelope {
 	case "goal.check":
 		// サーバー権威でのゴール判定を擬似再現（座標がゴール領域に入ったかの判定）。
 		simulateGoalCheck(in.Payload)
+
+	case "auth.login":
+		in.Payload = handleLogin(in.Payload)
+
+	case "auth.verify":
+		in.Payload = handleVerify(in.Payload)
+
+	case "match.quick":
+		in.Payload = handleMatchQuick(in.Payload)
+
+	case "room.create":
+		in.Payload = handleRoomCreate(in.Payload)
+
+	case "state.sync":
+		in.Payload = handleStateSync(in.Payload)
+
+	case "timer.sync":
+		in.Payload = handleTimerSync(in.Payload)
+
+	case "asset.load":
+		in.Payload = handleAssetLoad(in.Payload)
 	}
 
 	in.ServerSend = nowMicro()

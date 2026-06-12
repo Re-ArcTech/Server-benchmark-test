@@ -16,6 +16,9 @@ import (
 	"os"
 )
 
+// serverVersion はデプロイ確認用（/health と /stats に出る）。
+const serverVersion = "v2"
+
 func main() {
 	mux := http.NewServeMux()
 
@@ -23,8 +26,11 @@ func main() {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok " + serverVersion))
 	})
+
+	// リソース観測（負荷テスト用）。
+	mux.HandleFunc("/stats", handleStats)
 
 	// REST方式。OPTIONS（CORSプリフライト）にも対応。
 	mux.HandleFunc("/api/echo", func(w http.ResponseWriter, r *http.Request) {
