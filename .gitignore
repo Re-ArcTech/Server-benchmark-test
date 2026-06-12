@@ -1,0 +1,35 @@
+# ===== Unity =====
+My project/[Ll]ibrary/
+My project/[Tt]emp/
+My project/[Oo]bj/
+My project/[Bb]uild/
+My project/[Bb]uilds/
+My project/[Ll]ogs/
+My project/[Uu]ser[Ss]ettings/
+My project/[Mm]emoryCaptures/
+My project/[Rr]ecordings/
+My project/.vscode/
+*.csproj
+*.sln
+*.unityproj
+*.booproj
+*.pidb
+*.suo
+*.user
+*.tmp
+
+# Unity crash/Burst
+My project/sysinfo.txt
+My project/crashlog/
+
+# ===== Go server =====
+server/server
+server/yubi-bench-server
+/tmp/yubi-bench-server
+
+# ===== OS =====
+.DS_Store
+
+# ===== Bench output =====
+*_bench_result.csv
+*_bench_result.json

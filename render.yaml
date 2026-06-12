@@ -1,0 +1,28 @@
+# Render Blueprint - yubi-bench-server
+#
+# 使い方:
+#   1. このリポジトリを GitHub に push する
+#   2. Render ダッシュボード → New → Blueprint → このリポジトリを選択
+#   3. render.yaml が自動検出され、下記の Web Service が作られる
+#
+# 注意（WebRTCについて）:
+#   Render の通常 Web Service は HTTP/WebSocket（TCP）はそのまま通るが、
+#   WebRTC は UDP/ICE を使うため、Render の標準環境では DataChannel が
+#   確立できない可能性が高い（UDPの外向きポートが開かない）。
+#   → REST / WebSocket はこの構成でそのまま検証可能。
+#   → WebRTC のリモート計測は別途 TURN サーバ or UDP対応ホスト（VPS等）が必要。
+#     ローカル(localhost)では WebRTC も問題なく計測できる。
+
+services:
+  - type: web
+    name: yubi-bench-server
+    runtime: docker
+    rootDir: server
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: singapore # 日本に最も近い無料リージョン
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 8080
