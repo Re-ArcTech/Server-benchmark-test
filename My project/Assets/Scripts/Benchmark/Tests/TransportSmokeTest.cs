@@ -12,7 +12,9 @@ namespace YubiBench.Tests
     /// </summary>
     public class TransportSmokeTest
     {
-        private const string Url = "http://localhost:8080";
+        // 環境変数 YUBI_BENCH_URL があればそれを使う（Render計測用）。無ければ localhost。
+        private static string Url =>
+            System.Environment.GetEnvironmentVariable("YUBI_BENCH_URL") ?? "http://localhost:8080";
         private const int Iterations = 10;
 
         [UnityTest]

@@ -114,7 +114,7 @@ namespace YubiBench.Editor
             // ロジック + UI コンポーネントを作って参照を割り当て
             var logicGo = new GameObject("Benchmark");
             var runner = logicGo.AddComponent<BenchmarkRunner>();
-            runner.serverBaseUrl = "http://localhost:8080";
+            runner.serverBaseUrl = "https://yubi-bench-server.onrender.com";
             runner.runOnStart = false;
             runner.quitAfterRun = false;
 
