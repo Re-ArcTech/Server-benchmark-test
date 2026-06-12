@@ -33,6 +33,7 @@ namespace YubiBench
 
         [Header("実行")]
         public bool runOnStart = false;
+        public bool quitAfterRun = false; // 計測完了後にアプリを終了（実機/シミュレータ自動計測用）
 
         // シナリオ定義（名前, 回数を引く）
         private (string name, Func<int> count)[] Scenarios => new (string, Func<int>)[]
@@ -220,6 +221,17 @@ namespace YubiBench
             finally
             {
                 _running = false;
+            }
+
+            if (quitAfterRun)
+            {
+                Debug.Log("[Bench] quitAfterRun: アプリを終了します");
+                await Task.Delay(500);
+#if UNITY_EDITOR
+                UnityEditor.EditorApplication.isPlaying = false;
+#else
+                Application.Quit();
+#endif
             }
         }
 
