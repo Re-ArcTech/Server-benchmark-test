@@ -1,7 +1,9 @@
 {
     "name": "YubiBench",
     "rootNamespace": "YubiBench",
-    "references": [],
+    "references": [
+        "UnityEngine.UI"
+    ],
     "includePlatforms": [],
     "excludePlatforms": [],
     "allowUnsafeCode": false,

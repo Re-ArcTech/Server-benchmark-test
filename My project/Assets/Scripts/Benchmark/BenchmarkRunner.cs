@@ -1,5 +1,4 @@
 using System;
-using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -10,10 +9,9 @@ using UnityEngine;
 namespace YubiBench
 {
     /// <summary>
-    /// REST / WebSocket / WebRTC を同じシナリオで計測して比較する本体。
-    /// シーンの空 GameObject に貼り、Play すると（runOnStart=ON なら）自動計測する。
-    /// 画面の OnGUI に結果テーブルと総合スコア、シナリオ別の推奨方式を表示し、
-    /// 同じ内容を CSV / JSON で persistentDataPath に書き出す。
+    /// REST / WebSocket / WebRTC を同じシナリオで計測して比較する本体（UI非依存）。
+    /// 表示は <see cref="BenchmarkUI"/> がイベント（StatusChanged / ResultsReady）を購読して行う。
+    /// 計測結果は CSV / JSON で persistentDataPath にも書き出す。
     /// </summary>
     public class BenchmarkRunner : MonoBehaviour
     {
@@ -21,10 +19,10 @@ namespace YubiBench
         public string serverBaseUrl = "http://localhost:8080";
 
         [Header("各シナリオの試行回数")]
-        public int pingCount = 50;
-        public int moveCount = 100;
-        public int kickCount = 30;
-        public int goalCount = 30;
+        public int pingCount = 30;
+        public int moveCount = 50;
+        public int kickCount = 20;
+        public int goalCount = 20;
 
         [Header("計測する方式")]
         public bool enableRest = true;
@@ -33,25 +31,22 @@ namespace YubiBench
 
         [Header("実行")]
         public bool runOnStart = false;
-        public bool quitAfterRun = false; // 計測完了後にアプリを終了（実機/シミュレータ自動計測用）
+        public bool quitAfterRun = false; // 計測完了後にアプリを終了（自動計測用）
 
-        // シナリオ定義（名前, 回数を引く）
-        private (string name, Func<int> count)[] Scenarios => new (string, Func<int>)[]
-        {
-            ("ping", () => pingCount),
-            ("move", () => moveCount),
-            ("kick", () => kickCount),
-            ("goal", () => goalCount),
-        };
+        /// <summary>計測中の進捗テキスト。</summary>
+        public event Action<string> StatusChanged;
+        /// <summary>計測完了時、整形済み結果テキストを通知。</summary>
+        public event Action<string> ResultsReady;
+
+        public bool IsRunning => _running;
+
+        private static readonly string[] ScenarioNames = { "ping", "move", "kick", "goal" };
 
         private bool _running;
-        private string _status = "Idle. Press Run.";
         private readonly List<TransportResult> _results = new List<TransportResult>();
         private Dictionary<string, double> _scores = new Dictionary<string, double>();
-        private Vector2 _scroll;
         private string _exportPath = "";
 
-        /// <summary>1トランスポートの全シナリオ結果。</summary>
         private class TransportResult
         {
             public string Name;
@@ -71,93 +66,32 @@ namespace YubiBench
                 StartCoroutine(Unity.WebRTC.WebRTC.Update());
 #endif
             if (runOnStart)
-                RunBenchmark();
+                StartBenchmark();
         }
 
-        // ---- UI ----
-        private void OnGUI()
+        private int CountFor(string scenario)
         {
-            const int w = 720;
-            GUILayout.BeginArea(new Rect(10, 10, w, Screen.height - 20), GUI.skin.box);
-
-            GUILayout.Label("<b>ゆびサッカー 通信方式ベンチ</b> (REST / WebSocket / WebRTC)",
-                RichLabel());
-
-            GUILayout.BeginHorizontal();
-            GUILayout.Label("Server:", GUILayout.Width(55));
-            serverBaseUrl = GUILayout.TextField(serverBaseUrl, GUILayout.Width(420));
-            GUILayout.EndHorizontal();
-
-            GUILayout.BeginHorizontal();
-            enableRest = GUILayout.Toggle(enableRest, "REST", GUILayout.Width(90));
-            enableWebSocket = GUILayout.Toggle(enableWebSocket, "WebSocket", GUILayout.Width(110));
-            enableWebRtc = GUILayout.Toggle(enableWebRtc, "WebRTC", GUILayout.Width(90));
-            GUILayout.EndHorizontal();
-
-            GUI.enabled = !_running;
-            if (GUILayout.Button(_running ? "Running..." : "Run Benchmark", GUILayout.Height(34)))
-                RunBenchmark();
-            GUI.enabled = true;
-
-            GUILayout.Label("Status: " + _status);
-
-            _scroll = GUILayout.BeginScrollView(_scroll);
-            DrawResults();
-            GUILayout.EndScrollView();
-
-            if (!string.IsNullOrEmpty(_exportPath))
-                GUILayout.Label("Exported: " + _exportPath);
-
-            GUILayout.EndArea();
-        }
-
-        private static GUIStyle _rich;
-        private static GUIStyle RichLabel()
-        {
-            if (_rich == null) _rich = new GUIStyle(GUI.skin.label) { richText = true, fontSize = 14 };
-            return _rich;
-        }
-
-        private void DrawResults()
-        {
-            if (_results.Count == 0) return;
-
-            GUILayout.Label("<b>総合スコア（高いほど良い / 各項目の最良を満点とした相対評価）</b>", RichLabel());
-            foreach (var kv in _scores.OrderByDescending(k => k.Value))
-                GUILayout.Label($"  {kv.Key,-10} : {kv.Value,6:F1} 点");
-
-            GUILayout.Space(6);
-            GUILayout.Label("<b>RTT (ms) シナリオ別</b>  [avg / p50 / p95 / jitter]", RichLabel());
-            foreach (var r in _results)
+            switch (scenario)
             {
-                GUILayout.Label($"■ {r.Name}  connect={r.ConnectMs:F1}ms  success={r.SuccessRate * 100:F0}%");
-                foreach (var sc in Scenarios.Select(s => s.name))
-                {
-                    if (!r.ByScenario.TryGetValue(sc, out var st) || !st.HasData) continue;
-                    double sp = r.ServerProcByScenario.TryGetValue(sc, out var sps) ? sps.Avg : 0;
-                    GUILayout.Label(
-                        $"    {sc,-5} avg={st.Avg,6:F2} p50={st.P50,6:F2} p95={st.P95,6:F2} " +
-                        $"jit={st.Jitter,5:F2} (srv {sp:F3}ms)");
-                }
-            }
-
-            GUILayout.Space(6);
-            GUILayout.Label("<b>シナリオ別の推奨方式（p95 RTT が最小）</b>", RichLabel());
-            foreach (var sc in Scenarios.Select(s => s.name))
-            {
-                var best = _results
-                    .Where(r => r.ByScenario.TryGetValue(sc, out var st) && st.HasData)
-                    .OrderBy(r => r.ByScenario[sc].P95)
-                    .FirstOrDefault();
-                if (best != null)
-                    GUILayout.Label($"  {sc,-5} → {best.Name}  (p95={best.ByScenario[sc].P95:F2}ms)");
+                case "ping": return pingCount;
+                case "move": return moveCount;
+                case "kick": return kickCount;
+                case "goal": return goalCount;
+                default: return 10;
             }
         }
 
-        // ---- 実行 ----
-        private async void RunBenchmark()
+        private void SetStatus(string s) => StatusChanged?.Invoke(s);
+
+        /// <summary>計測を開始する（UIのボタン等から呼ぶ）。</summary>
+        public void StartBenchmark()
         {
             if (_running) return;
+            _ = RunBenchmarkAsync();
+        }
+
+        private async Task RunBenchmarkAsync()
+        {
             _running = true;
             _results.Clear();
             _scores.Clear();
@@ -166,9 +100,15 @@ namespace YubiBench
             try
             {
                 var transports = BuildTransports();
+                if (transports.Count == 0)
+                {
+                    SetStatus("計測する方式が選択されていません");
+                    return;
+                }
+
                 foreach (var t in transports)
                 {
-                    _status = $"{t.Name}: connecting...";
+                    SetStatus($"{t.Name}: 接続中...");
                     var r = new TransportResult { Name = t.Name };
 
                     bool ok = await t.ConnectAsync();
@@ -177,20 +117,20 @@ namespace YubiBench
 
                     if (!ok)
                     {
-                        _status = $"{t.Name}: connect FAILED";
+                        SetStatus($"{t.Name}: 接続失敗（サーバーURLを確認）");
                         _results.Add(r);
                         t.Close();
                         continue;
                     }
 
-                    foreach (var (name, count) in Scenarios)
+                    foreach (var name in ScenarioNames)
                     {
-                        int n = count();
+                        int n = CountFor(name);
                         var rtt = new LatencyStats();
                         var srv = new LatencyStats();
                         for (int i = 0; i < n; i++)
                         {
-                            _status = $"{t.Name}: {name} {i + 1}/{n}";
+                            SetStatus($"{t.Name}: {name} {i + 1}/{n}");
                             var res = await t.RoundTripAsync(Messages.Build(name, i));
                             r.Sent++;
                             if (res.Ok)
@@ -210,12 +150,14 @@ namespace YubiBench
 
                 ComputeScores();
                 Export();
-                _status = "Done.";
-                LogSummary();
+                string text = BuildResultsText();
+                SetStatus("計測完了");
+                ResultsReady?.Invoke(text);
+                Debug.Log(text);
             }
             catch (Exception e)
             {
-                _status = "ERROR: " + e.Message;
+                SetStatus("エラー: " + e.Message);
                 Debug.LogException(e);
             }
             finally
@@ -225,7 +167,6 @@ namespace YubiBench
 
             if (quitAfterRun)
             {
-                Debug.Log("[Bench] quitAfterRun: アプリを終了します");
                 await Task.Delay(500);
 #if UNITY_EDITOR
                 UnityEditor.EditorApplication.isPlaying = false;
@@ -245,8 +186,7 @@ namespace YubiBench
 #if YUBI_WEBRTC
                 list.Add(new WebRtcTransport(serverBaseUrl));
 #else
-                Debug.LogWarning("[Bench] WebRTC は YUBI_WEBRTC 未定義のためスキップ。" +
-                                 "com.unity.webrtc を入れて Scripting Define に YUBI_WEBRTC を追加してください。");
+                Debug.LogWarning("[Bench] WebRTC は YUBI_WEBRTC 未定義のためスキップ。");
 #endif
             }
             return list;
@@ -278,7 +218,49 @@ namespace YubiBench
             _scores = ScoreCalculator.ComputeScores(summaries);
         }
 
-        // ---- 出力 ----
+        /// <summary>画面・ログ表示用の整形済みテキストを作る。</summary>
+        private string BuildResultsText()
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine($"接続先: {serverBaseUrl}");
+            sb.AppendLine();
+            sb.AppendLine("◆ 総合スコア（高いほど良い）");
+            foreach (var kv in _scores.OrderByDescending(k => k.Value))
+                sb.AppendLine($"   {kv.Key,-10} {kv.Value,6:F1} 点");
+            sb.AppendLine();
+
+            sb.AppendLine("◆ RTT(ms)  [avg / p50 / p95 / jitter]");
+            foreach (var r in _results)
+            {
+                sb.AppendLine($" ■ {r.Name}  接続={r.ConnectMs:F0}ms  成功={r.SuccessRate * 100:F0}%");
+                if (!r.Connected) { sb.AppendLine("    （接続できませんでした）"); continue; }
+                foreach (var sc in ScenarioNames)
+                {
+                    if (!r.ByScenario.TryGetValue(sc, out var st) || !st.HasData) continue;
+                    double sp = r.ServerProcByScenario.TryGetValue(sc, out var sps) ? sps.Avg : 0;
+                    sb.AppendLine($"    {sc,-5} {st.Avg,7:F2} / {st.P50,6:F2} / {st.P95,6:F2} / {st.Jitter,5:F2}  (srv {sp:F3})");
+                }
+            }
+            sb.AppendLine();
+            sb.AppendLine("◆ シナリオ別おすすめ（p95最小）");
+            foreach (var sc in ScenarioNames)
+            {
+                var best = _results
+                    .Where(r => r.Connected && r.ByScenario.TryGetValue(sc, out var st) && st.HasData)
+                    .OrderBy(r => r.ByScenario[sc].P95)
+                    .FirstOrDefault();
+                if (best != null)
+                    sb.AppendLine($"    {sc,-5} → {best.Name} (p95 {best.ByScenario[sc].P95:F2}ms)");
+            }
+
+            if (!string.IsNullOrEmpty(_exportPath))
+            {
+                sb.AppendLine();
+                sb.AppendLine($"CSV出力: {_exportPath}");
+            }
+            return sb.ToString();
+        }
+
         private void Export()
         {
             var csv = new StringBuilder();
@@ -286,7 +268,7 @@ namespace YubiBench
             foreach (var r in _results)
             {
                 double score = _scores.TryGetValue(r.Name, out var s) ? s : 0;
-                foreach (var sc in Scenarios.Select(x => x.name))
+                foreach (var sc in ScenarioNames)
                 {
                     if (!r.ByScenario.TryGetValue(sc, out var st)) continue;
                     double srv = r.ServerProcByScenario.TryGetValue(sc, out var sp) ? sp.Avg : 0;
@@ -301,11 +283,7 @@ namespace YubiBench
             string dir = Application.persistentDataPath;
             string csvPath = Path.Combine(dir, "yubi_bench_result.csv");
             File.WriteAllText(csvPath, csv.ToString());
-
-            // JSON も（人が読む用の簡易構造）
-            string jsonPath = Path.Combine(dir, "yubi_bench_result.json");
-            File.WriteAllText(jsonPath, BuildJson());
-
+            File.WriteAllText(Path.Combine(dir, "yubi_bench_result.json"), BuildJson());
             _exportPath = csvPath;
             Debug.Log($"[Bench] exported: {csvPath}");
         }
@@ -324,7 +302,7 @@ namespace YubiBench
                   .Append("\"successRate\":").Append(F(r.SuccessRate)).Append(",")
                   .Append("\"score\":").Append(F(score)).Append(",")
                   .Append("\"scenarios\":{");
-                var names = Scenarios.Select(x => x.name).Where(n => r.ByScenario.ContainsKey(n)).ToList();
+                var names = ScenarioNames.Where(n => r.ByScenario.ContainsKey(n)).ToList();
                 for (int j = 0; j < names.Count; j++)
                 {
                     var st = r.ByScenario[names[j]];
@@ -339,25 +317,6 @@ namespace YubiBench
             }
             sb.Append("]}");
             return sb.ToString();
-        }
-
-        private void LogSummary()
-        {
-            var sb = new StringBuilder();
-            sb.AppendLine("===== Yubi Bench Summary =====");
-            sb.AppendLine("server: " + serverBaseUrl);
-            foreach (var kv in _scores.OrderByDescending(k => k.Value))
-                sb.AppendLine($"score {kv.Key,-10}: {kv.Value:F1}");
-            foreach (var r in _results)
-            {
-                sb.AppendLine($"-- {r.Name} connect={r.ConnectMs:F1}ms success={r.SuccessRate * 100:F0}%");
-                foreach (var sc in Scenarios.Select(x => x.name))
-                {
-                    if (!r.ByScenario.TryGetValue(sc, out var st) || !st.HasData) continue;
-                    sb.AppendLine($"   {sc,-5} avg={st.Avg:F2} p50={st.P50:F2} p95={st.P95:F2} jit={st.Jitter:F2}");
-                }
-            }
-            Debug.Log(sb.ToString());
         }
 
         private static string F(double v) => v.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
