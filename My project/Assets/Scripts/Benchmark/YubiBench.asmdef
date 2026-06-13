@@ -2,7 +2,8 @@
     "name": "YubiBench",
     "rootNamespace": "YubiBench",
     "references": [
-        "UnityEngine.UI"
+        "UnityEngine.UI",
+        "Unity.WebRTC"
     ],
     "includePlatforms": [],
     "excludePlatforms": [],
