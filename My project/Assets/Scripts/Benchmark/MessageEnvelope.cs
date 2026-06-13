@@ -45,6 +45,31 @@ namespace YubiBench
             => $"{{\"type\":\"goal.check\",\"seq\":{seq},\"timestamp\":{NowMs}," +
                "\"payload\":{\"ballPos\":{\"x\":20.0,\"y\":1.0,\"z\":0.0}}}";
 
+        public static string AuthLogin(long seq)
+            => $"{{\"type\":\"auth.login\",\"seq\":{seq},\"timestamp\":{NowMs}," +
+               "\"payload\":{\"user\":\"bench\",\"pass\":\"secret123\"}}";
+
+        public static string AuthVerify(long seq)
+            => $"{{\"type\":\"auth.verify\",\"seq\":{seq},\"timestamp\":{NowMs},\"payload\":{{}}}}";
+
+        public static string MatchQuick(long seq)
+            => $"{{\"type\":\"match.quick\",\"seq\":{seq},\"timestamp\":{NowMs}," +
+               "\"payload\":{\"playerId\":\"bench\"}}";
+
+        public static string RoomCreate(long seq)
+            => $"{{\"type\":\"room.create\",\"seq\":{seq},\"timestamp\":{NowMs}," +
+               "\"payload\":{\"name\":\"bench\"}}";
+
+        public static string StateSync(long seq)
+            => $"{{\"type\":\"state.sync\",\"seq\":{seq},\"timestamp\":{NowMs},\"payload\":{{}}}}";
+
+        public static string TimerSync(long seq)
+            => $"{{\"type\":\"timer.sync\",\"seq\":{seq},\"timestamp\":{NowMs},\"payload\":{{}}}}";
+
+        public static string AssetLoad(long seq)
+            => $"{{\"type\":\"asset.load\",\"seq\":{seq},\"timestamp\":{NowMs}," +
+               "\"payload\":{\"sizeKb\":64}}";
+
         /// <summary>シナリオ名から対応するリクエストビルダーを引く。</summary>
         public static string Build(string scenario, long seq)
         {
@@ -54,6 +79,13 @@ namespace YubiBench
                 case "move": return PlayerMove(seq);
                 case "kick": return BallKick(seq);
                 case "goal": return GoalCheck(seq);
+                case "login": return AuthLogin(seq);
+                case "verify": return AuthVerify(seq);
+                case "match": return MatchQuick(seq);
+                case "room": return RoomCreate(seq);
+                case "sync": return StateSync(seq);
+                case "timer": return TimerSync(seq);
+                case "load": return AssetLoad(seq);
                 default: return Echo(seq);
             }
         }

@@ -19,10 +19,12 @@ namespace YubiBench
         public string serverBaseUrl = "http://localhost:8080";
 
         [Header("各シナリオの試行回数")]
-        public int pingCount = 30;
+        public int pingCount = 50;
         public int moveCount = 50;
         public int kickCount = 20;
         public int goalCount = 20;
+        [Tooltip("login/verify/match/room/sync/timer/load の試行回数")]
+        public int miscCount = 15;
 
         [Header("計測する方式")]
         public bool enableRest = true;
@@ -40,7 +42,8 @@ namespace YubiBench
 
         public bool IsRunning => _running;
 
-        private static readonly string[] ScenarioNames = { "ping", "move", "kick", "goal" };
+        private static readonly string[] ScenarioNames =
+            { "ping", "move", "kick", "goal", "login", "verify", "match", "room", "sync", "timer", "load" };
 
         private bool _running;
         private readonly List<TransportResult> _results = new List<TransportResult>();
@@ -77,7 +80,7 @@ namespace YubiBench
                 case "move": return moveCount;
                 case "kick": return kickCount;
                 case "goal": return goalCount;
-                default: return 10;
+                default: return miscCount;
             }
         }
 
@@ -96,6 +99,15 @@ namespace YubiBench
             _results.Clear();
             _scores.Clear();
             _exportPath = "";
+
+            // 計測中はフレームレート上限を引き上げる。
+            // Unityのasync継続はフレームごとにしか再開しないため、低fpsだと
+            // RTTがフレーム間隔(60fps=16.7ms)単位に量子化されて過大に出る。
+            // 240fpsなら量子化誤差は最大~4msまで縮む（モバイルの既定30fpsだと~33ms乗る）。
+            int prevTarget = Application.targetFrameRate;
+            int prevVSync = UnityEngine.QualitySettings.vSyncCount;
+            Application.targetFrameRate = 240;
+            UnityEngine.QualitySettings.vSyncCount = 0;
 
             try
             {
@@ -162,6 +174,8 @@ namespace YubiBench
             }
             finally
             {
+                Application.targetFrameRate = prevTarget;
+                UnityEngine.QualitySettings.vSyncCount = prevVSync;
                 _running = false;
             }
 

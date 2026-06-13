@@ -16,7 +16,7 @@ namespace YubiBench
     {
         private readonly Uri _wsUri;
         private ClientWebSocket _ws;
-        private readonly byte[] _recvBuffer = new byte[64 * 1024];
+        private readonly byte[] _recvBuffer = new byte[256 * 1024]; // asset.load(最大512KB→既定64KB)が収まるサイズ
 
         public string Name => "WebSocket";
         public double LastConnectMillis { get; private set; }
@@ -47,7 +47,17 @@ namespace YubiBench
             }
         }
 
-        public async Task<RoundTripResult> RoundTripAsync(string requestJson)
+        public Task<RoundTripResult> RoundTripAsync(string requestJson)
+        {
+            // 計測全体をスレッドプール上で実行する。
+            // Unityのasync継続はメインスレッドだとフレーム境界でしか再開されず、
+            // RTTがフレーム間隔単位（60fps=16.7ms刻み）に量子化されてしまう。
+            // ClientWebSocket は純粋な .NET API なのでメインスレード外でも安全に使える
+            // （UnityWebRequest を使う REST はこの手が使えない点に注意）。
+            return Task.Run(() => RoundTripCore(requestJson));
+        }
+
+        private async Task<RoundTripResult> RoundTripCore(string requestJson)
         {
             if (_ws == null || _ws.State != WebSocketState.Open)
                 return RoundTripResult.Fail;
@@ -57,16 +67,25 @@ namespace YubiBench
                 byte[] send = Encoding.UTF8.GetBytes(requestJson);
                 var sw = Stopwatch.StartNew();
                 await _ws.SendAsync(new ArraySegment<byte>(send),
-                    WebSocketMessageType.Text, true, CancellationToken.None);
+                    WebSocketMessageType.Text, true, CancellationToken.None).ConfigureAwait(false);
 
-                // 1メッセージぶん受信（このベンチは1リクエスト1レスポンスのピンポン）
-                var result = await _ws.ReceiveAsync(new ArraySegment<byte>(_recvBuffer), CancellationToken.None);
+                // 大きいレスポンス（asset.load等）はフレーム分割で届くので EndOfMessage まで読む
+                int total = 0;
+                WebSocketReceiveResult result;
+                do
+                {
+                    result = await _ws.ReceiveAsync(
+                        new ArraySegment<byte>(_recvBuffer, total, _recvBuffer.Length - total),
+                        CancellationToken.None).ConfigureAwait(false);
+                    total += result.Count;
+                    if (total >= _recvBuffer.Length) break; // バッファ上限
+                } while (!result.EndOfMessage);
                 sw.Stop();
 
                 if (result.MessageType == WebSocketMessageType.Close)
                     return RoundTripResult.Fail;
 
-                string text = Encoding.UTF8.GetString(_recvBuffer, 0, result.Count);
+                string text = Encoding.UTF8.GetString(_recvBuffer, 0, total);
                 var resp = UnityEngine.JsonUtility.FromJson<RespEnvelope>(text);
                 return new RoundTripResult
                 {
