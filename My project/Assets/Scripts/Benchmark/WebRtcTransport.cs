@@ -53,7 +53,14 @@ namespace YubiBench
                 _pc = new RTCPeerConnection(ref config);
 
                 var opened = new TaskCompletionSource<bool>();
-                _channel = _pc.CreateDataChannel("bench");
+
+                // ★ロス耐性の検証で最重要: DataChannel を「unreliable + unordered」にする。
+                //   ordered=false       … 順番を保証しない
+                //   maxRetransmits=0     … ロスしても再送しない（消えたら諦める）
+                //   これでUDPの「投げっぱなし」になり、TCP/WebSocketの先頭詰まり(HOLブロッキング)を回避できる。
+                //   既定(reliable+ordered)のままだとUDPでも再送するのでTCPと同じ挙動になり差が出ない。
+                var init = new RTCDataChannelInit { ordered = false, maxRetransmits = 0 };
+                _channel = _pc.CreateDataChannel("bench", init);
                 _channel.OnOpen = () => opened.TrySetResult(true);
                 _channel.OnMessage = bytes =>
                 {

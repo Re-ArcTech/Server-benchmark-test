@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
+	"sync"
 
 	"github.com/pion/webrtc/v4"
 )
@@ -16,6 +19,49 @@ type rtcOfferRequest struct {
 // rtcAnswerResponse はサーバーが返す SDP answer。
 type rtcAnswerResponse struct {
 	SDP string `json:"sdp"`
+}
+
+var (
+	rtcAPIOnce sync.Once
+	rtcAPI     *webrtc.API
+)
+
+// getRTCAPI は SettingEngine を仕込んだ *webrtc.API を1回だけ作って使い回す。
+//
+// VPS/クラウドで動かす場合の2つのお作法:
+//   - PUBLIC_IP 環境変数を設定すると、その公開IPを 1:1 NAT として ICE 候補に広告する。
+//     これが無いとクラウド上のサーバーは「自分の公開住所」を相手に教えられず接続できない。
+//   - UDPポートを 50000-50100 に固定する。ファイアウォールはこの範囲だけ開ければよい。
+//     （例: ufw allow 50000:50100/udp）
+//
+// ローカル(PUBLIC_IP未設定)ではそのまま動く。
+func getRTCAPI() *webrtc.API {
+	rtcAPIOnce.Do(func() {
+		s := webrtc.SettingEngine{}
+
+		if ip := os.Getenv("PUBLIC_IP"); ip != "" {
+			s.SetNAT1To1IPs([]string{ip}, webrtc.ICECandidateTypeHost)
+			log.Printf("[rtc] advertising public IP: %s", ip)
+		}
+
+		minPort, maxPort := uint16(50000), uint16(50100)
+		if v := os.Getenv("UDP_PORT_MIN"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				minPort = uint16(n)
+			}
+		}
+		if v := os.Getenv("UDP_PORT_MAX"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				maxPort = uint16(n)
+			}
+		}
+		if err := s.SetEphemeralUDPPortRange(minPort, maxPort); err != nil {
+			log.Printf("[rtc] SetEphemeralUDPPortRange error: %v", err)
+		}
+
+		rtcAPI = webrtc.NewAPI(webrtc.WithSettingEngine(s))
+	})
+	return rtcAPI
 }
 
 // handleRTCOffer は WebRTC の「簡易シグナリング」エンドポイント。
@@ -49,7 +95,7 @@ func handleRTCOffer(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	pc, err := webrtc.NewPeerConnection(config)
+	pc, err := getRTCAPI().NewPeerConnection(config)
 	if err != nil {
 		log.Printf("[rtc] new peer connection error: %v", err)
 		http.Error(w, "rtc error", http.StatusInternalServerError)
