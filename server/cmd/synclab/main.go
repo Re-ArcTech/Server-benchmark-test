@@ -1,0 +1,281 @@
+// synclab - 位置同期の手法検証用リレーサーバー
+//
+// /synclab (WebSocket, :8090) に1クライアントが繋ぐと:
+//   - BOTが8の字に動き、その位置を sendRateHz で配信（=観測用の「他者」）
+//   - 自キャラは権威モード別に扱う（client=中継 / server=サーバー計算 / hybrid=訂正）
+//   - すべての送信に latencyMs の人工遅延を乗せる（手法の差を出すため）
+// 設定(config)はデバッグUIから動的に変更できる。
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"math"
+	"net/http"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+)
+
+type vec3 struct {
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
+	Z float64 `json:"z"`
+}
+
+// 受信メッセージ（type で分岐）
+type inMsg struct {
+	Type string `json:"type"`
+	// config
+	Authority  string  `json:"authority"`
+	SendRateHz float64 `json:"sendRateHz"`
+	LatencyMs  float64 `json:"latencyMs"`
+	// move / input
+	Seq  int64   `json:"seq"`
+	Pos  vec3    `json:"pos"`
+	RotY float64 `json:"rotY"`
+	Vel  vec3    `json:"vel"`
+	Dir  vec3    `json:"dir"`
+	Dt   float64 `json:"dt"`
+}
+
+var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+
+const (
+	fieldHalf = 10.0 // フィールドは [-10,10]
+	playerSpd = 6.0  // サーバー権威時の移動速度
+	corrThresh = 1.5 // ハイブリッド: このズレを超えたら訂正
+)
+
+type session struct {
+	conn *websocket.Conn
+
+	mu         sync.Mutex
+	authority  string
+	sendRateHz float64
+	latencyMs  float64
+
+	// サーバー権威用のプレイヤー状態
+	authPos vec3
+	// ハイブリッド用の直近正当位置
+	lastValidPos vec3
+
+	sendCh chan outItem
+	start  time.Time
+}
+
+type outItem struct {
+	sendAt time.Time
+	data   []byte
+}
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("synclab ok"))
+	})
+	mux.HandleFunc("/synclab", handleSync)
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8090"
+	}
+	log.Printf("synclab listening on :%s", port)
+	log.Fatal(http.ListenAndServe(":"+port, mux))
+}
+
+func handleSync(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	s := &session{
+		conn:       conn,
+		authority:  "client",
+		sendRateHz: 20,
+		latencyMs:  0,
+		sendCh:     make(chan outItem, 256),
+		start:      time.Now(),
+	}
+	log.Printf("[synclab] client connected: %s", r.RemoteAddr)
+
+	done := make(chan struct{})
+	go s.writer(done)   // 遅延キュー付きの送信ループ（順序＋スレッド安全）
+	go s.botLoop(done)  // BOT配信
+
+	// 受信ループ
+	for {
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			break
+		}
+		var m inMsg
+		if json.Unmarshal(data, &m) != nil {
+			continue
+		}
+		s.handle(&m)
+	}
+	close(done)
+	log.Printf("[synclab] client disconnected")
+}
+
+// writer は sendCh から取り出し、各メッセージの sendAt まで待ってから書く。
+// latency が一定なら順序は保たれる。書き込みは1goroutineに限定（gorillaの制約）。
+func (s *session) writer(done chan struct{}) {
+	for {
+		select {
+		case <-done:
+			return
+		case it := <-s.sendCh:
+			d := time.Until(it.sendAt)
+			if d > 0 {
+				select {
+				case <-done:
+					return
+				case <-time.After(d):
+				}
+			}
+			if err := s.conn.WriteMessage(websocket.TextMessage, it.data); err != nil {
+				return
+			}
+		}
+	}
+}
+
+// send は latency を乗せてキューに入れる。
+func (s *session) send(v any) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	lat := s.latencyMs
+	s.mu.Unlock()
+	select {
+	case s.sendCh <- outItem{sendAt: time.Now().Add(time.Duration(lat) * time.Millisecond), data: data}:
+	default: // バッファ溢れは捨てる（過負荷時）
+	}
+}
+
+func (s *session) botLoop(done chan struct{}) {
+	for {
+		s.mu.Lock()
+		hz := s.sendRateHz
+		s.mu.Unlock()
+		if hz <= 0 {
+			hz = 20
+		}
+		select {
+		case <-done:
+			return
+		case <-time.After(time.Duration(float64(time.Second) / hz)):
+		}
+
+		t := time.Since(s.start).Seconds()
+		// 8の字（リサージュ）
+		const A, B, wv = 7.0, 5.0, 1.2
+		pos := vec3{X: A * math.Sin(wv*t), Y: 0, Z: B * math.Sin(2*wv*t)}
+		// 解析的な速度（外挿テスト用）
+		vel := vec3{X: A * wv * math.Cos(wv*t), Y: 0, Z: B * 2 * wv * math.Cos(2*wv*t)}
+		rotY := math.Atan2(vel.X, vel.Z) * 180 / math.Pi
+
+		s.send(map[string]any{
+			"type": "bot.state",
+			"t":    time.Since(s.start).Milliseconds(),
+			"pos":  pos, "rotY": rotY, "vel": vel,
+		})
+	}
+}
+
+func (s *session) handle(m *inMsg) {
+	switch m.Type {
+	case "config":
+		s.mu.Lock()
+		if m.Authority != "" {
+			s.authority = m.Authority
+		}
+		if m.SendRateHz > 0 {
+			s.sendRateHz = m.SendRateHz
+		}
+		s.latencyMs = m.LatencyMs
+		s.mu.Unlock()
+		log.Printf("[synclab] config: authority=%s rate=%.0f latency=%.0f", m.Authority, m.SendRateHz, m.LatencyMs)
+
+	case "move": // クライアント/ハイブリッド権威
+		s.mu.Lock()
+		auth := s.authority
+		s.mu.Unlock()
+		if auth == "hybrid" {
+			s.handleHybridMove(m)
+		} else { // client
+			s.send(map[string]any{"type": "self.echo", "seq": m.Seq, "pos": m.Pos})
+		}
+
+	case "input": // サーバー権威
+		s.handleServerInput(m)
+	}
+}
+
+// handleServerInput はサーバー側でプレイヤーを動かして権威位置を返す。
+func (s *session) handleServerInput(m *inMsg) {
+	dt := m.Dt
+	if dt <= 0 || dt > 0.1 {
+		dt = 1.0 / 60
+	}
+	// 入力方向を正規化して等速移動
+	dx, dz := m.Dir.X, m.Dir.Z
+	l := math.Hypot(dx, dz)
+	s.mu.Lock()
+	if l > 0.001 {
+		s.authPos.X += (dx / l) * playerSpd * dt
+		s.authPos.Z += (dz / l) * playerSpd * dt
+	}
+	s.authPos = clampField(s.authPos)
+	pos := s.authPos
+	s.mu.Unlock()
+
+	vel := vec3{X: dx, Z: dz}
+	s.send(map[string]any{"type": "self.auth", "seq": m.Seq, "pos": pos, "vel": vel})
+}
+
+// handleHybridMove はクライアントの予測位置を検証し、ズレていれば訂正を返す。
+func (s *session) handleHybridMove(m *inMsg) {
+	s.mu.Lock()
+	clamped := clampField(m.Pos)
+	// フィールド外 or 前回正当位置から飛びすぎ → 訂正
+	jump := dist(m.Pos, s.lastValidPos)
+	needCorrection := clamped != m.Pos || jump > corrThresh
+	if !needCorrection {
+		s.lastValidPos = m.Pos
+	} else {
+		s.lastValidPos = clamped
+	}
+	pos := s.lastValidPos
+	s.mu.Unlock()
+
+	if needCorrection {
+		s.send(map[string]any{"type": "self.correction", "ackSeq": m.Seq, "pos": pos, "vel": m.Vel})
+	}
+}
+
+func clampField(p vec3) vec3 {
+	if p.X > fieldHalf {
+		p.X = fieldHalf
+	} else if p.X < -fieldHalf {
+		p.X = -fieldHalf
+	}
+	if p.Z > fieldHalf {
+		p.Z = fieldHalf
+	} else if p.Z < -fieldHalf {
+		p.Z = -fieldHalf
+	}
+	return p
+}
+
+func dist(a, b vec3) float64 {
+	return math.Sqrt((a.X-b.X)*(a.X-b.X) + (a.Z-b.Z)*(a.Z-b.Z))
+}
