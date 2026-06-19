@@ -16,7 +16,18 @@ namespace SyncLab
 
         public void Add(double tMs, Vector3 pos, Vector3 vel)
         {
-            _snaps.Add(new Snap { tMs = tMs, pos = pos, vel = vel });
+            var snap = new Snap { tMs = tMs, pos = pos, vel = vel };
+            // ジッターで到着順が乱れることがあるので、t順を保つよう挿入する
+            if (_snaps.Count == 0 || tMs >= _snaps[_snaps.Count - 1].tMs)
+            {
+                _snaps.Add(snap);
+            }
+            else
+            {
+                int i = _snaps.Count - 1;
+                while (i >= 0 && _snaps[i].tMs > tMs) i--;
+                _snaps.Insert(i + 1, snap);
+            }
             if (_snaps.Count > MaxSnaps) _snaps.RemoveAt(0);
         }
 

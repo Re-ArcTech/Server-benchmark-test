@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"log"
 	"math"
+	"math/rand"
 	"net/http"
 	"os"
 	"sync"
@@ -32,6 +33,8 @@ type inMsg struct {
 	Authority  string  `json:"authority"`
 	SendRateHz float64 `json:"sendRateHz"`
 	LatencyMs  float64 `json:"latencyMs"`
+	JitterMs   float64 `json:"jitterMs"`
+	LossRate   float64 `json:"lossRate"`
 	// move / input
 	Seq  int64   `json:"seq"`
 	Pos  vec3    `json:"pos"`
@@ -56,6 +59,8 @@ type session struct {
 	authority  string
 	sendRateHz float64
 	latencyMs  float64
+	jitterMs   float64
+	lossRate   float64
 
 	// サーバー権威用のプレイヤー状態
 	authPos vec3
@@ -154,9 +159,19 @@ func (s *session) send(v any) {
 	}
 	s.mu.Lock()
 	lat := s.latencyMs
+	jit := s.jitterMs
+	loss := s.lossRate
 	s.mu.Unlock()
+
+	if loss > 0 && rand.Float64() < loss {
+		return // パケットロス: 送らない
+	}
+	extra := lat
+	if jit > 0 {
+		extra += rand.Float64() * jit // ジッター: 0〜jit の追加遅延（到着順が乱れることもある＝実回線的）
+	}
 	select {
-	case s.sendCh <- outItem{sendAt: time.Now().Add(time.Duration(lat) * time.Millisecond), data: data}:
+	case s.sendCh <- outItem{sendAt: time.Now().Add(time.Duration(extra) * time.Millisecond), data: data}:
 	default: // バッファ溢れは捨てる（過負荷時）
 	}
 }
@@ -202,8 +217,11 @@ func (s *session) handle(m *inMsg) {
 			s.sendRateHz = m.SendRateHz
 		}
 		s.latencyMs = m.LatencyMs
+		s.jitterMs = m.JitterMs
+		s.lossRate = m.LossRate
 		s.mu.Unlock()
-		log.Printf("[synclab] config: authority=%s rate=%.0f latency=%.0f", m.Authority, m.SendRateHz, m.LatencyMs)
+		log.Printf("[synclab] config: authority=%s rate=%.0f latency=%.0f jitter=%.0f loss=%.2f",
+			m.Authority, m.SendRateHz, m.LatencyMs, m.JitterMs, m.LossRate)
 
 	case "move": // クライアント/ハイブリッド権威
 		s.mu.Lock()

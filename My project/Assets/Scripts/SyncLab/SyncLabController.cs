@@ -20,6 +20,8 @@ namespace SyncLab
 
         [Header("設定（OnGUIから操作）")]
         public float injectedLatencyMs = 100f; // 片道のネットワーク遅延を再現
+        public float jitterMs = 0f;            // 遅延のばらつき（到着ムラ）
+        public float lossRate = 0f;            // パケットロス率(0〜1)
         public bool interpolate = true;          // 相手側が補間するか
         public float interpDelayMs = 100f;       // 補間ディレイ（過去をどれだけ遡って描くか）
         public bool extrapolate = false;
@@ -38,7 +40,7 @@ namespace SyncLab
         private float _sendAccum;
         private long _seq;
 
-        private float _lastLatency = -1, _lastRate = -1;
+        private float _lastLatency = -1, _lastRate = -1, _lastJitter = -1, _lastLoss = -1;
 
         private void Awake()
         {
@@ -161,17 +163,18 @@ namespace SyncLab
         private void PushConfigIfChanged()
         {
             if (!_client.Connected) return;
-            if (Mathf.Approximately(injectedLatencyMs, _lastLatency) && Mathf.Approximately(sendRateHz, _lastRate)) return;
-            _lastLatency = injectedLatencyMs; _lastRate = sendRateHz;
-            _client.Send(MsgConfig(sendRateHz, injectedLatencyMs));
+            if (Mathf.Approximately(injectedLatencyMs, _lastLatency) && Mathf.Approximately(sendRateHz, _lastRate)
+                && Mathf.Approximately(jitterMs, _lastJitter) && Mathf.Approximately(lossRate, _lastLoss)) return;
+            _lastLatency = injectedLatencyMs; _lastRate = sendRateHz; _lastJitter = jitterMs; _lastLoss = lossRate;
+            _client.Send(MsgConfig(sendRateHz, injectedLatencyMs, jitterMs, lossRate));
         }
 
         private static string F(float v) => v.ToString("0.###", CultureInfo.InvariantCulture);
         private static string V(Vector3 v) => $"{{\"x\":{F(v.x)},\"y\":{F(v.y)},\"z\":{F(v.z)}}}";
         private string MsgMove(long seq, Vector3 pos, Vector3 vel)
             => $"{{\"type\":\"move\",\"seq\":{seq},\"pos\":{V(pos)},\"vel\":{V(vel)}}}";
-        private string MsgConfig(float hz, float lat)
-            => $"{{\"type\":\"config\",\"authority\":\"client\",\"sendRateHz\":{F(hz)},\"latencyMs\":{F(lat)}}}";
+        private string MsgConfig(float hz, float lat, float jit, float loss)
+            => $"{{\"type\":\"config\",\"authority\":\"client\",\"sendRateHz\":{F(hz)},\"latencyMs\":{F(lat)},\"jitterMs\":{F(jit)},\"lossRate\":{F(loss)}}}";
 
         // ---- UI ----
         private void OnGUI()
@@ -193,6 +196,10 @@ namespace SyncLab
             GUILayout.Space(6);
             GUILayout.Label($"<b>遅延注入: {injectedLatencyMs:F0} ms（片道）</b>", Rich());
             injectedLatencyMs = GUILayout.HorizontalSlider(injectedLatencyMs, 0, 300);
+            GUILayout.Label($"ジッター: {jitterMs:F0} ms（遅延のばらつき＝到着ムラ）");
+            jitterMs = GUILayout.HorizontalSlider(jitterMs, 0, 200);
+            GUILayout.Label($"パケットロス: {lossRate * 100:F0} %");
+            lossRate = GUILayout.HorizontalSlider(lossRate, 0, 0.3f);
             interpolate = GUILayout.Toggle(interpolate, "相手側が補間する");
             GUILayout.Label($"補間ディレイ: {interpDelayMs:F0} ms");
             interpDelayMs = GUILayout.HorizontalSlider(interpDelayMs, 0, 300);
@@ -218,15 +225,26 @@ namespace SyncLab
         private string Explain()
         {
             float gap = injectedLatencyMs + (interpolate ? interpDelayMs : 0);
+            string s;
             if (!interpolate)
             {
-                return $"<color=#fc8>補間OFF：</color>緑は届いた最新位置にパッと飛ぶ＝<color=#fc8>カクカク</color>。\n" +
-                       $"あなたの動きは約 {injectedLatencyMs:F0}ms 遅れて相手に届く。";
+                s = $"<color=#fc8>補間OFF：</color>緑は届いた最新位置にパッと飛ぶ＝<color=#fc8>カクカク</color>。\n" +
+                    $"あなたの動きは約 {injectedLatencyMs:F0}ms 遅れて相手に届く。";
             }
-            return $"<color=#8f8>補間ON：</color>緑は過去 {interpDelayMs:F0}ms を描くので<color=#8f8>滑らか</color>。\n" +
-                   $"代わりに、相手にはあなたが約 <b>{gap:F0}ms 過去</b>の位置に見えている\n" +
-                   $"（遅延{injectedLatencyMs:F0} + 補間ディレイ{interpDelayMs:F0}）。\n" +
-                   $"→ 滑らかさ と 遅れ のトレードオフ。";
+            else
+            {
+                s = $"<color=#8f8>補間ON：</color>緑は過去 {interpDelayMs:F0}ms を描くので<color=#8f8>滑らか</color>。\n" +
+                    $"代わりに相手にはあなたが約 <b>{gap:F0}ms 過去</b>に見える（遅延{injectedLatencyMs:F0}+ディレイ{interpDelayMs:F0}）。";
+            }
+            if (jitterMs > 1f || lossRate > 0.001f)
+            {
+                s += $"\n<color=#fcc>悪条件：ジッター{jitterMs:F0}ms / ロス{lossRate * 100:F0}%。</color>";
+                if (interpDelayMs < jitterMs + 50f)
+                    s += " <color=#f88>補間ディレイがジッターに足りず、緑がガタつく/飛ぶ。</color>";
+                else
+                    s += " <color=#8f8>補間ディレイがジッターを吸収して滑らか。これがディレイの仕事。</color>";
+            }
+            return s;
         }
 
         private static GUIStyle _rich;
