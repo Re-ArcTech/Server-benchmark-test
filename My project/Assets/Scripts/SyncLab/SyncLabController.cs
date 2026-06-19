@@ -5,78 +5,61 @@ using UnityEngine;
 namespace SyncLab
 {
     /// <summary>
-    /// 位置同期の手法を切り替えて比較するデバッグツール本体。
-    /// ビジュアル（床・自キャラ・BOT・生位置ゴースト）はコードで生成し、
-    /// OnGUI のパネルでトグル/スライダーを操作する。
+    /// 「あなた」vs「相手から見えるあなた」を並べて、遅延と補間が何なのかを体感するデバッグツール。
     ///
-    /// 色の意味:
-    ///   青 = 自キャラの表示位置 / 赤(小) = サーバーが知ってる自分の位置(生)
-    ///   緑 = BOTの表示位置       / 赤(小) = BOTの受信した生位置
+    ///   青  = あなた（操作した瞬間に動く＝自分の画面の自分）
+    ///   緑  = 相手の画面に映るあなた（サーバー経由で遅れて届いた姿を補間したもの）
+    ///   赤(小) = 補間する前の生の受信位置（カクカク）
+    ///
+    /// 自分でWASDで動かすと、緑が遅れてついてくる。補間ON/OFFや遅延でその見え方が変わる。
     /// </summary>
     public class SyncLabController : MonoBehaviour
     {
-        public enum Authority { Client, Hybrid, Server }
-
         [Header("接続")]
         public string serverUrl = "ws://localhost:8090";
 
         [Header("設定（OnGUIから操作）")]
-        public Authority authority = Authority.Client;
-        public bool otherInterpolate = true;
-        public float interpDelayMs = 100f;
+        public float injectedLatencyMs = 100f; // 片道のネットワーク遅延を再現
+        public bool interpolate = true;          // 相手側が補間するか
+        public float interpDelayMs = 100f;       // 補間ディレイ（過去をどれだけ遡って描くか）
         public bool extrapolate = false;
-        public bool selfPredict = true;
-        public bool correctionOn = true;
-        public float injectedLatencyMs = 0f;
         public float sendRateHz = 20f;
 
         private const float Speed = 6f;
 
         private SyncClient _client;
-        private Transform _self, _bot, _selfGhost, _botGhost;
+        private Transform _you, _shadow, _rawGhost;
 
-        private Vector3 _intendedPos;   // 入力から積分した「動かしたい」位置（送信＆予測表示に使う）
-        private Vector3 _serverSelfPos; // サーバーが知ってる自分の位置（赤ゴースト）
-        private readonly SnapshotBuffer _botBuf = new SnapshotBuffer();
-        private Vector3 _botRawPos;     // 最新の生BOT位置
+        private Vector3 _intendedPos;            // 入力から積分した「あなた」の位置
+        private readonly SnapshotBuffer _echoBuf = new SnapshotBuffer();
+        private Vector3 _rawEchoPos;             // 最新の生エコー位置
         private double _interpClockMs;
 
         private float _sendAccum;
         private long _seq;
-        private int _correctionCount;
 
-        // 設定変更検知（サーバーへconfig送信用）
-        private Authority _lastAuth = (Authority)(-1);
         private float _lastLatency = -1, _lastRate = -1;
 
-        // ---- セットアップ ----
         private void Awake()
         {
             BuildVisuals();
             _client = new SyncClient();
         }
 
-        private void Start()
-        {
-            _client.Connect(serverUrl);
-        }
-
+        private void Start() => _client.Connect(serverUrl);
         private void OnDestroy() => _client?.Close();
 
         private void BuildVisuals()
         {
-            // 床
             var ground = GameObject.CreatePrimitive(PrimitiveType.Plane);
             ground.name = "Ground";
-            ground.transform.localScale = new Vector3(2.4f, 1, 2.4f); // 24x24（フィールド±10）
+            ground.transform.localScale = new Vector3(2.4f, 1, 2.4f);
             ground.GetComponent<Renderer>().sharedMaterial = Mat(new Color(0.15f, 0.18f, 0.22f));
 
-            _self = MakeCapsule("Self_Display", new Color(0.2f, 0.5f, 1f));
-            _bot = MakeCapsule("Bot_Display", new Color(0.2f, 0.85f, 0.4f));
-            _selfGhost = MakeSphere("Self_Ghost(raw)", new Color(1f, 0.3f, 0.3f), 0.5f);
-            _botGhost = MakeSphere("Bot_Ghost(raw)", new Color(1f, 0.5f, 0.2f), 0.5f);
+            _you = MakeCapsule("あなた(青)", new Color(0.25f, 0.55f, 1f));
+            _shadow = MakeCapsule("相手から見えるあなた(緑)", new Color(0.25f, 0.85f, 0.4f));
+            _rawGhost = MakeSphere("生位置(赤)", new Color(1f, 0.3f, 0.3f), 0.5f);
 
-            // カメラ（斜め見下ろし）
             if (Camera.main == null)
             {
                 var camGo = new GameObject("Main Camera");
@@ -114,7 +97,6 @@ namespace SyncLab
             return go.transform;
         }
 
-        // URP環境でも確実に色がつくマテリアル
         private static Material Mat(Color c)
         {
             var sh = Shader.Find("Universal Render Pipeline/Unlit");
@@ -127,116 +109,76 @@ namespace SyncLab
             return m;
         }
 
-        // ---- メインループ ----
         private void Update()
         {
             float dt = Time.deltaTime;
             PushConfigIfChanged();
 
-            // 1. 入力 → intendedPos を積分（常に「動かしたい位置」を更新）
+            // 1. 入力 → あなたの位置（即反映）
             float ix = Input.GetAxisRaw("Horizontal");
             float iz = Input.GetAxisRaw("Vertical");
             var dir = new Vector3(ix, 0, iz);
             if (dir.sqrMagnitude > 1f) dir.Normalize();
             _intendedPos += dir * Speed * dt;
 
-            // 2. 送信（sendRateHz で間引き）
+            // 2. 位置をサーバーに送る（相手に届く想定。クライアント権威）
             _sendAccum += dt;
             float interval = 1f / Mathf.Max(1f, sendRateHz);
             if (_client.Connected && _sendAccum >= interval)
             {
                 _sendAccum = 0;
-                if (authority == Authority.Server)
-                    _client.Send(MsgInput(_seq, dir, interval));
-                else
-                    _client.Send(MsgMove(_seq, _intendedPos, dir * Speed));
+                _client.Send(MsgMove(_seq, _intendedPos, dir * Speed));
                 _seq++;
             }
 
-            // 3. 受信処理
+            // 3. 受信（自分のエコー＝相手に届いた自分の位置）
             while (_client.TryReceive(out var json))
-                HandleMessage(json);
-
-            // 4. 補間クロックを進める（最新サーバー時刻 - 補間ディレイ に緩く追従）
-            _interpClockMs += dt * 1000.0;
-            if (_botBuf.Count > 0)
             {
-                double target = _botBuf.NewestT - interpDelayMs;
-                _interpClockMs += (target - _interpClockMs) * 0.1; // 緩く同期
+                SMsg m;
+                try { m = JsonUtility.FromJson<SMsg>(json); } catch { continue; }
+                if (m == null || m.type != "self.echo") continue; // botは無視
+                _rawEchoPos = m.pos.V();
+                _echoBuf.Add(m.t, m.pos.V(), m.vel.V());
             }
 
-            // 5. 表示更新
-            Vector3 botShow = otherInterpolate ? _botBuf.Sample(_interpClockMs, extrapolate) : _botRawPos;
-            _bot.position = Lift(botShow, 1f);
-            _botGhost.position = Lift(_botRawPos, 0.5f);
+            // 4. 補間クロック
+            _interpClockMs += dt * 1000.0;
+            if (_echoBuf.Count > 0)
+            {
+                double target = _echoBuf.NewestT - interpDelayMs;
+                _interpClockMs += (target - _interpClockMs) * 0.1;
+            }
 
-            Vector3 selfShow = selfPredict ? _intendedPos : _serverSelfPos;
-            _self.position = Lift(selfShow, 1f);
-            _selfGhost.position = Lift(_serverSelfPos, 0.5f);
+            // 5. 表示
+            _you.position = Lift(_intendedPos, 1f);                       // 青=あなた（今）
+            Vector3 shadow = interpolate ? _echoBuf.Sample(_interpClockMs, extrapolate) : _rawEchoPos;
+            _shadow.position = Lift(shadow, 1f);                          // 緑=相手から見えるあなた
+            _rawGhost.position = Lift(_rawEchoPos, 0.5f);                 // 赤=生位置
         }
 
         private static Vector3 Lift(Vector3 p, float y) => new Vector3(p.x, y, p.z);
 
-        private void HandleMessage(string json)
-        {
-            SMsg m;
-            try { m = JsonUtility.FromJson<SMsg>(json); }
-            catch { return; }
-            if (m == null || string.IsNullOrEmpty(m.type)) return;
-
-            switch (m.type)
-            {
-                case "bot.state":
-                    _botRawPos = m.pos.V();
-                    _botBuf.Add(m.t, m.pos.V(), m.vel.V());
-                    break;
-
-                case "self.echo":
-                    _serverSelfPos = m.pos.V();
-                    break;
-
-                case "self.auth":
-                    _serverSelfPos = m.pos.V();
-                    if (selfPredict && correctionOn)
-                        _intendedPos = Vector3.Lerp(_intendedPos, _serverSelfPos, 0.15f); // 緩い訂正
-                    break;
-
-                case "self.correction":
-                    _serverSelfPos = m.pos.V();
-                    _correctionCount++;
-                    if (correctionOn) _intendedPos = _serverSelfPos; // スナップ訂正
-                    break;
-            }
-        }
-
-        // ---- 設定送信 ----
         private void PushConfigIfChanged()
         {
             if (!_client.Connected) return;
-            if (authority == _lastAuth && Mathf.Approximately(injectedLatencyMs, _lastLatency)
-                && Mathf.Approximately(sendRateHz, _lastRate)) return;
-            _lastAuth = authority; _lastLatency = injectedLatencyMs; _lastRate = sendRateHz;
-            _client.Send(MsgConfig(AuthStr(authority), sendRateHz, injectedLatencyMs));
+            if (Mathf.Approximately(injectedLatencyMs, _lastLatency) && Mathf.Approximately(sendRateHz, _lastRate)) return;
+            _lastLatency = injectedLatencyMs; _lastRate = sendRateHz;
+            _client.Send(MsgConfig(sendRateHz, injectedLatencyMs));
         }
 
-        // ---- メッセージ構築 ----
         private static string F(float v) => v.ToString("0.###", CultureInfo.InvariantCulture);
         private static string V(Vector3 v) => $"{{\"x\":{F(v.x)},\"y\":{F(v.y)},\"z\":{F(v.z)}}}";
-
         private string MsgMove(long seq, Vector3 pos, Vector3 vel)
             => $"{{\"type\":\"move\",\"seq\":{seq},\"pos\":{V(pos)},\"vel\":{V(vel)}}}";
-        private string MsgInput(long seq, Vector3 dir, float dt)
-            => $"{{\"type\":\"input\",\"seq\":{seq},\"dir\":{V(dir)},\"dt\":{F(dt)}}}";
-        private string MsgConfig(string auth, float hz, float lat)
-            => $"{{\"type\":\"config\",\"authority\":\"{auth}\",\"sendRateHz\":{F(hz)},\"latencyMs\":{F(lat)}}}";
-        private static string AuthStr(Authority a) => a == Authority.Server ? "server" : a == Authority.Hybrid ? "hybrid" : "client";
+        private string MsgConfig(float hz, float lat)
+            => $"{{\"type\":\"config\",\"authority\":\"client\",\"sendRateHz\":{F(hz)},\"latencyMs\":{F(lat)}}}";
 
-        // ---- デバッグUI ----
+        // ---- UI ----
         private void OnGUI()
         {
-            const int w = 340;
+            const int w = 360;
             GUILayout.BeginArea(new Rect(8, 8, w, Screen.height - 16), GUI.skin.box);
-            GUILayout.Label("<b>同期ラボ (SyncLab)</b>", Rich());
+            GUILayout.Label("<b>同期ラボ：あなた vs 相手から見えるあなた</b>", Rich());
 
             GUILayout.BeginHorizontal();
             serverUrl = GUILayout.TextField(serverUrl);
@@ -244,70 +186,56 @@ namespace SyncLab
             GUILayout.EndHorizontal();
             GUILayout.Label("状態: " + (_client.Connected ? "<color=#6f6>接続中</color>" : "<color=#f66>未接続</color> " + _client.LastError), Rich());
 
-            GUILayout.Space(4);
-            GUILayout.Label("<b>権威</b>", Rich());
-            GUILayout.BeginHorizontal();
-            if (GUILayout.Toggle(authority == Authority.Client, "クライアント")) authority = Authority.Client;
-            if (GUILayout.Toggle(authority == Authority.Hybrid, "ハイブリッド")) authority = Authority.Hybrid;
-            if (GUILayout.Toggle(authority == Authority.Server, "サーバー")) authority = Authority.Server;
-            GUILayout.EndHorizontal();
+            GUILayout.Space(6);
+            GUILayout.Label("<b>● 何を見てるか</b>", Rich());
+            GUILayout.Label("<color=#7af>青=あなた（今ここ）</color>\n<color=#7f7>緑=相手の画面に映るあなた</color>\n<color=#f77>赤=補間前の生位置</color>", Rich());
 
-            GUILayout.Space(4);
-            GUILayout.Label("<b>他人(BOT)の見せ方</b>", Rich());
-            otherInterpolate = GUILayout.Toggle(otherInterpolate, "補間（OFFで直接適用）");
+            GUILayout.Space(6);
+            GUILayout.Label($"<b>遅延注入: {injectedLatencyMs:F0} ms（片道）</b>", Rich());
+            injectedLatencyMs = GUILayout.HorizontalSlider(injectedLatencyMs, 0, 300);
+            interpolate = GUILayout.Toggle(interpolate, "相手側が補間する");
             GUILayout.Label($"補間ディレイ: {interpDelayMs:F0} ms");
             interpDelayMs = GUILayout.HorizontalSlider(interpDelayMs, 0, 300);
             extrapolate = GUILayout.Toggle(extrapolate, "外挿（パケット欠け時に先読み）");
-
-            GUILayout.Space(4);
-            GUILayout.Label("<b>自分の見せ方</b>", Rich());
-            selfPredict = GUILayout.Toggle(selfPredict, "予測（OFFでサーバー待ち＝遅延体感）");
-            correctionOn = GUILayout.Toggle(correctionOn, "サーバー訂正を適用");
-
-            GUILayout.Space(4);
-            GUILayout.Label("<b>ネットワーク</b>", Rich());
-            GUILayout.Label($"遅延注入: {injectedLatencyMs:F0} ms（片道）");
-            injectedLatencyMs = GUILayout.HorizontalSlider(injectedLatencyMs, 0, 300);
             GUILayout.Label($"送信レート: {sendRateHz:F0} Hz");
             sendRateHz = GUILayout.HorizontalSlider(sendRateHz, 5, 60);
 
-            GUILayout.Space(6);
-            GUILayout.Label("<b>プリセット</b>", Rich());
-            GUILayout.BeginHorizontal();
-            if (GUILayout.Button("①素朴")) Preset(Authority.Client, false, false);
-            if (GUILayout.Button("②C+補間")) Preset(Authority.Client, true, false);
-            GUILayout.EndHorizontal();
-            GUILayout.BeginHorizontal();
-            if (GUILayout.Button("③ハイブリッド")) Preset(Authority.Hybrid, true, true);
-            if (GUILayout.Button("④サーバー")) Preset(Authority.Server, true, false);
-            GUILayout.EndHorizontal();
+            GUILayout.Space(8);
+            GUILayout.Label("<b>● 今おきていること</b>", Rich());
+            GUILayout.Label(Explain(), Rich());
 
-            GUILayout.Space(6);
-            GUILayout.Label($"訂正回数: {_correctionCount}  バッファ: {_botBuf.Count}", Rich());
-            GUILayout.Label("<color=#9cf>青=自分表示</color> <color=#f88>赤=生位置</color> <color=#9f9>緑=BOT表示</color>", Rich());
-            GUILayout.Label("移動: WASD / 矢印キー", Rich());
+            GUILayout.Space(8);
+            GUILayout.Label("<b>● 試してみて</b>", Rich());
+            GUILayout.Label("WASD/矢印で青を動かす。急にカクッと動かすと緑の遅れが分かる。\n" +
+                            "・遅延を上げる → 緑がもっと遅れる\n" +
+                            "・補間OFF → 緑が赤と同じ（ワープ）\n" +
+                            "・補間ON → 緑が滑らか", Rich());
 
             GUILayout.EndArea();
         }
 
-        private void Preset(Authority a, bool interp, bool predict)
+        // 現在の設定で何が起きているかを日本語で説明
+        private string Explain()
         {
-            authority = a;
-            otherInterpolate = interp;
-            selfPredict = predict || a != Authority.Client; // サーバー権威は予測しないが訂正で寄せる
-            if (a == Authority.Hybrid) { selfPredict = true; correctionOn = true; }
-            if (a == Authority.Server) { selfPredict = false; correctionOn = true; }
-            if (a == Authority.Client) { selfPredict = interp ? false : false; correctionOn = false; }
+            float gap = injectedLatencyMs + (interpolate ? interpDelayMs : 0);
+            if (!interpolate)
+            {
+                return $"<color=#fc8>補間OFF：</color>緑は届いた最新位置にパッと飛ぶ＝<color=#fc8>カクカク</color>。\n" +
+                       $"あなたの動きは約 {injectedLatencyMs:F0}ms 遅れて相手に届く。";
+            }
+            return $"<color=#8f8>補間ON：</color>緑は過去 {interpDelayMs:F0}ms を描くので<color=#8f8>滑らか</color>。\n" +
+                   $"代わりに、相手にはあなたが約 <b>{gap:F0}ms 過去</b>の位置に見えている\n" +
+                   $"（遅延{injectedLatencyMs:F0} + 補間ディレイ{interpDelayMs:F0}）。\n" +
+                   $"→ 滑らかさ と 遅れ のトレードオフ。";
         }
 
         private static GUIStyle _rich;
         private static GUIStyle Rich()
         {
-            if (_rich == null) _rich = new GUIStyle(GUI.skin.label) { richText = true };
+            if (_rich == null) _rich = new GUIStyle(GUI.skin.label) { richText = true, wordWrap = true };
             return _rich;
         }
 
-        // ---- 受信メッセージ型 ----
         [Serializable] public class SV3 { public float x, y, z; public Vector3 V() => new Vector3(x, y, z); }
         [Serializable]
         public class SMsg
@@ -315,7 +243,6 @@ namespace SyncLab
             public string type;
             public long t;
             public long seq;
-            public long ackSeq;
             public SV3 pos = new SV3();
             public float rotY;
             public SV3 vel = new SV3();

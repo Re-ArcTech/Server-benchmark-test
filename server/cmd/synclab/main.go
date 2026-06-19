@@ -212,7 +212,11 @@ func (s *session) handle(m *inMsg) {
 		if auth == "hybrid" {
 			s.handleHybridMove(m)
 		} else { // client
-			s.send(map[string]any{"type": "self.echo", "seq": m.Seq, "pos": m.Pos})
+			// 「相手から見えるあなた」を描くため、受信時刻tと速度velも返す（補間用）
+			s.send(map[string]any{
+				"type": "self.echo", "seq": m.Seq,
+				"t": time.Since(s.start).Milliseconds(), "pos": m.Pos, "vel": m.Vel,
+			})
 		}
 
 	case "input": // サーバー権威
