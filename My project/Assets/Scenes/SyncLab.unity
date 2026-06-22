@@ -119,7 +119,7 @@ NavMeshSettings:
     debug:
       m_Flags: 0
   m_NavMeshData: {fileID: 0}
---- !u!1 &508988573
+--- !u!1 &1655086875
 GameObject:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
@@ -127,8 +127,8 @@ GameObject:
   m_PrefabAsset: {fileID: 0}
   serializedVersion: 6
   m_Component:
-  - component: {fileID: 508988575}
-  - component: {fileID: 508988574}
+  - component: {fileID: 1655086877}
+  - component: {fileID: 1655086876}
   m_Layer: 0
   m_Name: SyncLab
   m_TagString: Untagged
@@ -136,13 +136,13 @@ GameObject:
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
   m_IsActive: 1
---- !u!114 &508988574
+--- !u!114 &1655086876
 MonoBehaviour:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 508988573}
+  m_GameObject: {fileID: 1655086875}
   m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: b7278290286a249e2bf9e76d7b10f566, type: 3}
@@ -152,18 +152,18 @@ MonoBehaviour:
   injectedLatencyMs: 100
   jitterMs: 0
   lossRate: 0
+  sendRateHz: 20
   interpolate: 1
   interpDelayMs: 100
   extrapolate: 0
-  sendRateHz: 20
   ballMode: 2
---- !u!4 &508988575
+--- !u!4 &1655086877
 Transform:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 508988573}
+  m_GameObject: {fileID: 1655086875}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
   m_LocalPosition: {x: 0, y: 0, z: 0}
@@ -176,4 +176,4 @@ Transform:
 SceneRoots:
   m_ObjectHideFlags: 0
   m_Roots:
-  - {fileID: 508988575}
+  - {fileID: 1655086877}

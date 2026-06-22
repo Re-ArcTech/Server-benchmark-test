@@ -1,31 +1,35 @@
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using UnityEngine;
 
 namespace SyncLab
 {
     /// <summary>
-    /// 「あなた」vs「相手から見えるあなた」を並べて、遅延と補間が何なのかを体感するデバッグツール。
+    /// マルチプレイ同期ラボ。複数クライアントが同じサーバーに繋ぎ、同じボールを共有する。
     ///
-    ///   青  = あなた（操作した瞬間に動く＝自分の画面の自分）
-    ///   緑  = 相手の画面に映るあなた（サーバー経由で遅れて届いた姿を補間したもの）
-    ///   赤(小) = 補間する前の生の受信位置（カクカク）
+    ///   青   = あなた（操作した瞬間に動く）
+    ///   緑   = 他プレイヤー（受信位置を補間して描画）
+    ///   橙/色 = ボール（所有者の色になる）。Spaceで蹴ると所有権を奪える
     ///
-    /// 自分でWASDで動かすと、緑が遅れてついてくる。補間ON/OFFや遅延でその見え方が変わる。
+    /// サーバーが「位置の中継」「ボールの所有権裁定」をするので、ここで初めてサーバーが
+    /// 仲介者として意味を持つ。遅延/ジッター/ロスは個別に注入できる。
     /// </summary>
     public class SyncLabController : MonoBehaviour
     {
         [Header("接続")]
         public string serverUrl = "ws://localhost:8090";
 
-        [Header("設定（OnGUIから操作）")]
-        public float injectedLatencyMs = 100f; // 片道のネットワーク遅延を再現
-        public float jitterMs = 0f;            // 遅延のばらつき（到着ムラ）
-        public float lossRate = 0f;            // パケットロス率(0〜1)
-        public bool interpolate = true;          // 相手側が補間するか
-        public float interpDelayMs = 100f;       // 補間ディレイ（過去をどれだけ遡って描くか）
-        public bool extrapolate = false;
+        [Header("ネットワーク注入")]
+        public float injectedLatencyMs = 100f;
+        public float jitterMs = 0f;
+        public float lossRate = 0f;
         public float sendRateHz = 20f;
+
+        [Header("他プレイヤーの見せ方")]
+        public bool interpolate = true;
+        public float interpDelayMs = 100f;
+        public bool extrapolate = false;
 
         [Header("ボール")]
         public BallMode ballMode = BallMode.Extrap;
@@ -34,21 +38,26 @@ namespace SyncLab
         private const float Speed = 6f;
 
         private SyncClient _client;
-        private Transform _you, _shadow, _rawGhost, _ball, _ballGhost;
+        private string _myId = "";
+        private Transform _you, _ball, _ballGhost;
+        private Material _ballMat;
 
-        private Vector3 _intendedPos;            // 入力から積分した「あなた」の位置
-        private readonly SnapshotBuffer _echoBuf = new SnapshotBuffer();
-        private Vector3 _rawEchoPos;             // 最新の生エコー位置
+        private Vector3 _intendedPos;
         private double _interpClockMs;
+
+        // 他プレイヤー
+        private class Remote { public Transform tf; public readonly SnapshotBuffer buf = new SnapshotBuffer(); public Vector3 raw; }
+        private readonly Dictionary<string, Remote> _remotes = new Dictionary<string, Remote>();
+        private double _newestRemoteT;
 
         // ボール
         private readonly SnapshotBuffer _ballBuf = new SnapshotBuffer();
         private Vector3 _rawBallPos, _rawBallVel;
         private float _lastBallRecvTime;
+        private string _ballOwner = "";
 
         private float _sendAccum;
         private long _seq;
-
         private float _lastLatency = -1, _lastRate = -1, _lastJitter = -1, _lastLoss = -1;
 
         private void Awake()
@@ -68,10 +77,8 @@ namespace SyncLab
             ground.GetComponent<Renderer>().sharedMaterial = Mat(new Color(0.15f, 0.18f, 0.22f));
 
             _you = MakeCapsule("あなた(青)", new Color(0.25f, 0.55f, 1f));
-            _shadow = MakeCapsule("相手から見えるあなた(緑)", new Color(0.25f, 0.85f, 0.4f));
-            _rawGhost = MakeSphere("生位置(赤)", new Color(1f, 0.3f, 0.3f), 0.5f);
-            _ball = MakeSphere("ボール(橙)", new Color(1f, 0.6f, 0.1f), 0.7f);
-            _ballGhost = MakeSphere("ボール生位置(赤)", new Color(1f, 0.3f, 0.3f), 0.4f);
+            _ball = MakeSphere("ボール", new Color(1f, 0.6f, 0.1f), 0.7f, out _ballMat);
+            _ballGhost = MakeSphere("ボール生位置(赤)", new Color(1f, 0.3f, 0.3f), 0.4f, out _);
 
             if (Camera.main == null)
             {
@@ -94,19 +101,18 @@ namespace SyncLab
             var go = GameObject.CreatePrimitive(PrimitiveType.Capsule);
             go.name = name;
             go.GetComponent<Renderer>().sharedMaterial = Mat(c);
-            var col = go.GetComponent<Collider>();
-            if (col != null) Destroy(col);
+            var col = go.GetComponent<Collider>(); if (col != null) Destroy(col);
             return go.transform;
         }
 
-        private Transform MakeSphere(string name, Color c, float scale)
+        private Transform MakeSphere(string name, Color c, float scale, out Material mat)
         {
             var go = GameObject.CreatePrimitive(PrimitiveType.Sphere);
             go.name = name;
             go.transform.localScale = Vector3.one * scale;
-            go.GetComponent<Renderer>().sharedMaterial = Mat(c);
-            var col = go.GetComponent<Collider>();
-            if (col != null) Destroy(col);
+            mat = Mat(c);
+            go.GetComponent<Renderer>().sharedMaterial = mat;
+            var col = go.GetComponent<Collider>(); if (col != null) Destroy(col);
             return go.transform;
         }
 
@@ -127,14 +133,17 @@ namespace SyncLab
             float dt = Time.deltaTime;
             PushConfigIfChanged();
 
-            // 1. 入力 → あなたの位置（即反映）
+            // 入力 → あなた（即）
             float ix = Input.GetAxisRaw("Horizontal");
             float iz = Input.GetAxisRaw("Vertical");
             var dir = new Vector3(ix, 0, iz);
             if (dir.sqrMagnitude > 1f) dir.Normalize();
             _intendedPos += dir * Speed * dt;
 
-            // 2. 位置をサーバーに送る（相手に届く想定。クライアント権威）
+            if (_client.Connected && Input.GetKeyDown(KeyCode.Space))
+                _client.Send(MsgKick(_intendedPos));
+
+            // 送信（位置）
             _sendAccum += dt;
             float interval = 1f / Mathf.Max(1f, sendRateHz);
             if (_client.Connected && _sendAccum >= interval)
@@ -144,45 +153,30 @@ namespace SyncLab
                 _seq++;
             }
 
-            // キック（Space）。ボールに近ければサーバーが蹴る
-            if (_client.Connected && Input.GetKeyDown(KeyCode.Space))
-                _client.Send(MsgKick(_intendedPos));
-
-            // 3. 受信（自分のエコー／ボール）
+            // 受信
             while (_client.TryReceive(out var json))
-            {
-                SMsg m;
-                try { m = JsonUtility.FromJson<SMsg>(json); } catch { continue; }
-                if (m == null) continue;
-                if (m.type == "self.echo")
-                {
-                    _rawEchoPos = m.pos.V();
-                    _echoBuf.Add(m.t, m.pos.V(), m.vel.V());
-                }
-                else if (m.type == "ball.state")
-                {
-                    _rawBallPos = m.pos.V();
-                    _rawBallVel = m.vel.V();
-                    _ballBuf.Add(m.t, m.pos.V(), m.vel.V());
-                    _lastBallRecvTime = Time.time;
-                }
-            }
+                HandleMessage(json);
 
-            // 4. 補間クロック
+            // 補間クロック（最新サーバー時刻 - ディレイ に追従）
             _interpClockMs += dt * 1000.0;
-            if (_echoBuf.Count > 0)
+            double newest = Math.Max(_newestRemoteT, _ballBuf.NewestT);
+            if (newest > 0)
             {
-                double target = _echoBuf.NewestT - interpDelayMs;
+                double target = newest - interpDelayMs;
                 _interpClockMs += (target - _interpClockMs) * 0.1;
             }
 
-            // 5. 表示
-            _you.position = Lift(_intendedPos, 1f);                       // 青=あなた（今）
-            Vector3 shadow = interpolate ? _echoBuf.Sample(_interpClockMs, extrapolate) : _rawEchoPos;
-            _shadow.position = Lift(shadow, 1f);                          // 緑=相手から見えるあなた
-            _rawGhost.position = Lift(_rawEchoPos, 0.5f);                 // 赤=生位置
+            // 表示：あなた
+            _you.position = Lift(_intendedPos, 1f);
 
-            // ボール表示（生 / 補間=過去 / 外挿=未来）
+            // 表示：他プレイヤー
+            foreach (var r in _remotes.Values)
+            {
+                Vector3 p = interpolate ? r.buf.Sample(_interpClockMs, extrapolate) : r.raw;
+                r.tf.position = Lift(p, 1f);
+            }
+
+            // 表示：ボール
             Vector3 ballShow;
             switch (ballMode)
             {
@@ -192,6 +186,61 @@ namespace SyncLab
             }
             _ball.position = Lift(ballShow, 0.7f);
             _ballGhost.position = Lift(_rawBallPos, 0.4f);
+            UpdateBallColor();
+        }
+
+        private void HandleMessage(string json)
+        {
+            SMsg m;
+            try { m = JsonUtility.FromJson<SMsg>(json); } catch { return; }
+            if (m == null || string.IsNullOrEmpty(m.type)) return;
+
+            switch (m.type)
+            {
+                case "welcome":
+                    _myId = m.id;
+                    break;
+
+                case "player.state":
+                    {
+                        if (!_remotes.TryGetValue(m.id, out var r))
+                        {
+                            r = new Remote { tf = MakeCapsule("他プレイヤー " + m.id, new Color(0.25f, 0.85f, 0.4f)) };
+                            _remotes[m.id] = r;
+                        }
+                        r.raw = m.pos.V();
+                        r.buf.Add(m.t, m.pos.V(), m.vel.V());
+                        if (m.t > _newestRemoteT) _newestRemoteT = m.t;
+                    }
+                    break;
+
+                case "player.left":
+                    if (_remotes.TryGetValue(m.id, out var gone))
+                    {
+                        Destroy(gone.tf.gameObject);
+                        _remotes.Remove(m.id);
+                    }
+                    break;
+
+                case "ball.state":
+                    _rawBallPos = m.pos.V();
+                    _rawBallVel = m.vel.V();
+                    _ballBuf.Add(m.t, m.pos.V(), m.vel.V());
+                    _lastBallRecvTime = Time.time;
+                    _ballOwner = m.owner ?? "";
+                    break;
+            }
+        }
+
+        private void UpdateBallColor()
+        {
+            Color c;
+            if (string.IsNullOrEmpty(_ballOwner)) c = new Color(0.6f, 0.6f, 0.6f);      // 誰も触ってない=灰
+            else if (_ballOwner == _myId) c = new Color(0.25f, 0.55f, 1f);              // 自分=青
+            else c = new Color(1f, 0.6f, 0.1f);                                          // 他人=橙
+            if (_ballMat.HasProperty("_BaseColor")) _ballMat.SetColor("_BaseColor", c);
+            if (_ballMat.HasProperty("_Color")) _ballMat.SetColor("_Color", c);
+            _ballMat.color = c;
         }
 
         private static Vector3 Lift(Vector3 p, float y) => new Vector3(p.x, y, p.z);
@@ -202,98 +251,68 @@ namespace SyncLab
             if (Mathf.Approximately(injectedLatencyMs, _lastLatency) && Mathf.Approximately(sendRateHz, _lastRate)
                 && Mathf.Approximately(jitterMs, _lastJitter) && Mathf.Approximately(lossRate, _lastLoss)) return;
             _lastLatency = injectedLatencyMs; _lastRate = sendRateHz; _lastJitter = jitterMs; _lastLoss = lossRate;
-            _client.Send(MsgConfig(sendRateHz, injectedLatencyMs, jitterMs, lossRate));
+            _client.Send(MsgConfig(injectedLatencyMs, jitterMs, lossRate));
         }
 
         private static string F(float v) => v.ToString("0.###", CultureInfo.InvariantCulture);
         private static string V(Vector3 v) => $"{{\"x\":{F(v.x)},\"y\":{F(v.y)},\"z\":{F(v.z)}}}";
         private string MsgMove(long seq, Vector3 pos, Vector3 vel)
             => $"{{\"type\":\"move\",\"seq\":{seq},\"pos\":{V(pos)},\"vel\":{V(vel)}}}";
-        private string MsgConfig(float hz, float lat, float jit, float loss)
-            => $"{{\"type\":\"config\",\"authority\":\"client\",\"sendRateHz\":{F(hz)},\"latencyMs\":{F(lat)},\"jitterMs\":{F(jit)},\"lossRate\":{F(loss)}}}";
-        private string MsgKick(Vector3 pos)
-            => $"{{\"type\":\"kick\",\"pos\":{V(pos)}}}";
+        private string MsgConfig(float lat, float jit, float loss)
+            => $"{{\"type\":\"config\",\"latencyMs\":{F(lat)},\"jitterMs\":{F(jit)},\"lossRate\":{F(loss)}}}";
+        private string MsgKick(Vector3 pos) => $"{{\"type\":\"kick\",\"pos\":{V(pos)}}}";
 
         // ---- UI ----
         private void OnGUI()
         {
             const int w = 360;
             GUILayout.BeginArea(new Rect(8, 8, w, Screen.height - 16), GUI.skin.box);
-            GUILayout.Label("<b>同期ラボ：あなた vs 相手から見えるあなた</b>", Rich());
+            GUILayout.Label("<b>同期ラボ（マルチプレイ・所有権）</b>", Rich());
 
             GUILayout.BeginHorizontal();
             serverUrl = GUILayout.TextField(serverUrl);
             if (GUILayout.Button("接続", GUILayout.Width(56))) _client.Connect(serverUrl);
             GUILayout.EndHorizontal();
-            GUILayout.Label("状態: " + (_client.Connected ? "<color=#6f6>接続中</color>" : "<color=#f66>未接続</color> " + _client.LastError), Rich());
+            GUILayout.Label("状態: " + (_client.Connected ? $"<color=#6f6>接続中</color> id={_myId}" : "<color=#f66>未接続</color> " + _client.LastError), Rich());
+            GUILayout.Label($"他プレイヤー: {_remotes.Count}人  /  ボール所有者: {OwnerLabel()}", Rich());
 
             GUILayout.Space(6);
-            GUILayout.Label("<b>● 何を見てるか</b>", Rich());
-            GUILayout.Label("<color=#7af>青=あなた（今ここ）</color>\n<color=#7f7>緑=相手の画面に映るあなた</color>\n<color=#fb4>橙=ボール</color> <color=#f77>赤=補間前の生位置</color>", Rich());
-
-            GUILayout.Space(6);
-            GUILayout.Label($"<b>遅延注入: {injectedLatencyMs:F0} ms（片道）</b>", Rich());
+            GUILayout.Label($"遅延注入: {injectedLatencyMs:F0} ms");
             injectedLatencyMs = GUILayout.HorizontalSlider(injectedLatencyMs, 0, 300);
-            GUILayout.Label($"ジッター: {jitterMs:F0} ms（遅延のばらつき＝到着ムラ）");
+            GUILayout.Label($"ジッター: {jitterMs:F0} ms");
             jitterMs = GUILayout.HorizontalSlider(jitterMs, 0, 200);
             GUILayout.Label($"パケットロス: {lossRate * 100:F0} %");
             lossRate = GUILayout.HorizontalSlider(lossRate, 0, 0.3f);
-            interpolate = GUILayout.Toggle(interpolate, "相手側が補間する");
-            GUILayout.Label($"補間ディレイ: {interpDelayMs:F0} ms");
-            interpDelayMs = GUILayout.HorizontalSlider(interpDelayMs, 0, 300);
-            extrapolate = GUILayout.Toggle(extrapolate, "外挿（パケット欠け時に先読み）");
             GUILayout.Label($"送信レート: {sendRateHz:F0} Hz");
             sendRateHz = GUILayout.HorizontalSlider(sendRateHz, 5, 60);
 
             GUILayout.Space(6);
-            GUILayout.Label("<b>● ボール（橙）の見せ方</b>", Rich());
+            GUILayout.Label("<b>他プレイヤー(緑)の見せ方</b>", Rich());
+            interpolate = GUILayout.Toggle(interpolate, "補間");
+            GUILayout.Label($"補間ディレイ: {interpDelayMs:F0} ms");
+            interpDelayMs = GUILayout.HorizontalSlider(interpDelayMs, 0, 300);
+            extrapolate = GUILayout.Toggle(extrapolate, "外挿");
+
+            GUILayout.Space(6);
+            GUILayout.Label("<b>ボールの見せ方</b>", Rich());
             GUILayout.BeginHorizontal();
             if (GUILayout.Toggle(ballMode == BallMode.Raw, "生")) ballMode = BallMode.Raw;
-            if (GUILayout.Toggle(ballMode == BallMode.Interp, "補間(過去)")) ballMode = BallMode.Interp;
-            if (GUILayout.Toggle(ballMode == BallMode.Extrap, "外挿(未来)")) ballMode = BallMode.Extrap;
+            if (GUILayout.Toggle(ballMode == BallMode.Interp, "補間")) ballMode = BallMode.Interp;
+            if (GUILayout.Toggle(ballMode == BallMode.Extrap, "外挿")) ballMode = BallMode.Extrap;
             GUILayout.EndHorizontal();
-            GUILayout.Label("ボールに近づいて <b>Space</b> で蹴る", Rich());
 
-            GUILayout.Space(8);
-            GUILayout.Label("<b>● 今おきていること</b>", Rich());
-            GUILayout.Label(Explain(), Rich());
-
-            GUILayout.Space(8);
-            GUILayout.Label("<b>● 試してみて</b>", Rich());
-            GUILayout.Label("WASD/矢印で青を動かす。Spaceでボールを蹴る。\n" +
-                            "・遅延を上げる → 緑(あなたの分身)が遅れる\n" +
-                            "<b>ボール実験(遅延を150+に):</b>\n" +
-                            "・橙を「補間」に → ボールが赤(生)より遅れる＝過去。当てに行くと外す\n" +
-                            "・橙を「外挿」に → ボールが今ある所に近い＝当てやすい\n" +
-                            "・緑(あなた=過去)と橙(外挿=未来)の<b>時間軸のズレ</b>も見える", Rich());
+            GUILayout.Space(6);
+            GUILayout.Label("<color=#7af>青=あなた</color> <color=#7f7>緑=他人</color>  ボール色=所有者(灰なし/青自分/橙他人)", Rich());
+            GUILayout.Label("WASD/矢印=移動、<b>Space=蹴る(=所有権を奪う)</b>", Rich());
+            GUILayout.Label("2人目: ターミナルで <b>go run ./cmd/synclab-bot</b>\nまたは ParrelSync で2エディタ", Rich());
 
             GUILayout.EndArea();
         }
 
-        // 現在の設定で何が起きているかを日本語で説明
-        private string Explain()
+        private string OwnerLabel()
         {
-            float gap = injectedLatencyMs + (interpolate ? interpDelayMs : 0);
-            string s;
-            if (!interpolate)
-            {
-                s = $"<color=#fc8>補間OFF：</color>緑は届いた最新位置にパッと飛ぶ＝<color=#fc8>カクカク</color>。\n" +
-                    $"あなたの動きは約 {injectedLatencyMs:F0}ms 遅れて相手に届く。";
-            }
-            else
-            {
-                s = $"<color=#8f8>補間ON：</color>緑は過去 {interpDelayMs:F0}ms を描くので<color=#8f8>滑らか</color>。\n" +
-                    $"代わりに相手にはあなたが約 <b>{gap:F0}ms 過去</b>に見える（遅延{injectedLatencyMs:F0}+ディレイ{interpDelayMs:F0}）。";
-            }
-            if (jitterMs > 1f || lossRate > 0.001f)
-            {
-                s += $"\n<color=#fcc>悪条件：ジッター{jitterMs:F0}ms / ロス{lossRate * 100:F0}%。</color>";
-                if (interpDelayMs < jitterMs + 50f)
-                    s += " <color=#f88>補間ディレイがジッターに足りず、緑がガタつく/飛ぶ。</color>";
-                else
-                    s += " <color=#8f8>補間ディレイがジッターを吸収して滑らか。これがディレイの仕事。</color>";
-            }
-            return s;
+            if (string.IsNullOrEmpty(_ballOwner)) return "なし";
+            return _ballOwner == _myId ? "あなた" : _ballOwner;
         }
 
         private static GUIStyle _rich;
@@ -308,11 +327,12 @@ namespace SyncLab
         public class SMsg
         {
             public string type;
+            public string id;
             public long t;
-            public long seq;
             public SV3 pos = new SV3();
             public float rotY;
             public SV3 vel = new SV3();
+            public string owner;
         }
     }
 }
