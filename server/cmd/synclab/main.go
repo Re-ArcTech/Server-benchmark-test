@@ -47,9 +47,11 @@ type inMsg struct {
 var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
 const (
-	fieldHalf = 10.0 // フィールドは [-10,10]
-	playerSpd = 6.0  // サーバー権威時の移動速度
-	corrThresh = 1.5 // ハイブリッド: このズレを超えたら訂正
+	fieldHalf  = 10.0 // フィールドは [-10,10]
+	playerSpd  = 6.0  // サーバー権威時の移動速度
+	corrThresh = 1.5  // ハイブリッド: このズレを超えたら訂正
+	kickRange  = 2.5  // この距離以内ならボールを蹴れる
+	kickPower  = 12.0 // キックの初速
 )
 
 type session struct {
@@ -66,6 +68,10 @@ type session struct {
 	authPos vec3
 	// ハイブリッド用の直近正当位置
 	lastValidPos vec3
+
+	// ボール（サーバーが簡易物理を回す＝観測対象）
+	ballPos vec3
+	ballVel vec3
 
 	sendCh chan outItem
 	start  time.Time
@@ -108,9 +114,13 @@ func handleSync(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("[synclab] client connected: %s", r.RemoteAddr)
 
+	// ボール初期状態（動いてる方が外挿/補間の差が見える）
+	s.ballPos = vec3{X: 3, Z: 3}
+	s.ballVel = vec3{X: 4, Z: 2}
+
 	done := make(chan struct{})
-	go s.writer(done)   // 遅延キュー付きの送信ループ（順序＋スレッド安全）
-	go s.botLoop(done)  // BOT配信
+	go s.writer(done)    // 遅延キュー付きの送信ループ（順序＋スレッド安全）
+	go s.ballLoop(done)  // ボール物理＋配信
 
 	// 受信ループ
 	for {
@@ -176,33 +186,61 @@ func (s *session) send(v any) {
 	}
 }
 
-func (s *session) botLoop(done chan struct{}) {
+// ballLoop はボールの簡易物理を60Hzで回し、sendRateHz でボール状態を配信する。
+func (s *session) ballLoop(done chan struct{}) {
+	tick := time.NewTicker(time.Second / 60)
+	defer tick.Stop()
+	last := time.Now()
+	var sinceBroadcast float64
+
 	for {
-		s.mu.Lock()
-		hz := s.sendRateHz
-		s.mu.Unlock()
-		if hz <= 0 {
-			hz = 20
-		}
 		select {
 		case <-done:
 			return
-		case <-time.After(time.Duration(float64(time.Second) / hz)):
+		case <-tick.C:
 		}
+		now := time.Now()
+		dt := now.Sub(last).Seconds()
+		last = now
 
-		t := time.Since(s.start).Seconds()
-		// 8の字（リサージュ）
-		const A, B, wv = 7.0, 5.0, 1.2
-		pos := vec3{X: A * math.Sin(wv*t), Y: 0, Z: B * math.Sin(2*wv*t)}
-		// 解析的な速度（外挿テスト用）
-		vel := vec3{X: A * wv * math.Cos(wv*t), Y: 0, Z: B * 2 * wv * math.Cos(2*wv*t)}
-		rotY := math.Atan2(vel.X, vel.Z) * 180 / math.Pi
+		s.mu.Lock()
+		// 等速移動＋摩擦＋壁で反射
+		s.ballPos.X += s.ballVel.X * dt
+		s.ballPos.Z += s.ballVel.Z * dt
+		decay := math.Pow(0.7, dt) // 1秒で30%減速
+		s.ballVel.X *= decay
+		s.ballVel.Z *= decay
+		if s.ballPos.X > fieldHalf {
+			s.ballPos.X = fieldHalf
+			s.ballVel.X = -s.ballVel.X
+		} else if s.ballPos.X < -fieldHalf {
+			s.ballPos.X = -fieldHalf
+			s.ballVel.X = -s.ballVel.X
+		}
+		if s.ballPos.Z > fieldHalf {
+			s.ballPos.Z = fieldHalf
+			s.ballVel.Z = -s.ballVel.Z
+		} else if s.ballPos.Z < -fieldHalf {
+			s.ballPos.Z = -fieldHalf
+			s.ballVel.Z = -s.ballVel.Z
+		}
+		hz := s.sendRateHz
+		pos := s.ballPos
+		vel := s.ballVel
+		s.mu.Unlock()
 
-		s.send(map[string]any{
-			"type": "bot.state",
-			"t":    time.Since(s.start).Milliseconds(),
-			"pos":  pos, "rotY": rotY, "vel": vel,
-		})
+		if hz <= 0 {
+			hz = 20
+		}
+		sinceBroadcast += dt
+		if sinceBroadcast >= 1.0/hz {
+			sinceBroadcast = 0
+			s.send(map[string]any{
+				"type": "ball.state",
+				"t":    time.Since(s.start).Milliseconds(),
+				"pos":  pos, "vel": vel,
+			})
+		}
 	}
 }
 
@@ -239,6 +277,20 @@ func (s *session) handle(m *inMsg) {
 
 	case "input": // サーバー権威
 		s.handleServerInput(m)
+
+	case "kick": // ボールを蹴る（プレイヤー位置がボールに近ければ）
+		s.mu.Lock()
+		dx := s.ballPos.X - m.Pos.X
+		dz := s.ballPos.Z - m.Pos.Z
+		d := math.Hypot(dx, dz)
+		if d < kickRange {
+			if d < 0.001 {
+				d = 0.001
+			}
+			s.ballVel.X = dx / d * kickPower
+			s.ballVel.Z = dz / d * kickPower
+		}
+		s.mu.Unlock()
 	}
 }
 

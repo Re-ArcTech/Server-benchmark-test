@@ -27,15 +27,24 @@ namespace SyncLab
         public bool extrapolate = false;
         public float sendRateHz = 20f;
 
+        [Header("ボール")]
+        public BallMode ballMode = BallMode.Extrap;
+        public enum BallMode { Raw, Interp, Extrap }
+
         private const float Speed = 6f;
 
         private SyncClient _client;
-        private Transform _you, _shadow, _rawGhost;
+        private Transform _you, _shadow, _rawGhost, _ball, _ballGhost;
 
         private Vector3 _intendedPos;            // 入力から積分した「あなた」の位置
         private readonly SnapshotBuffer _echoBuf = new SnapshotBuffer();
         private Vector3 _rawEchoPos;             // 最新の生エコー位置
         private double _interpClockMs;
+
+        // ボール
+        private readonly SnapshotBuffer _ballBuf = new SnapshotBuffer();
+        private Vector3 _rawBallPos, _rawBallVel;
+        private float _lastBallRecvTime;
 
         private float _sendAccum;
         private long _seq;
@@ -61,6 +70,8 @@ namespace SyncLab
             _you = MakeCapsule("あなた(青)", new Color(0.25f, 0.55f, 1f));
             _shadow = MakeCapsule("相手から見えるあなた(緑)", new Color(0.25f, 0.85f, 0.4f));
             _rawGhost = MakeSphere("生位置(赤)", new Color(1f, 0.3f, 0.3f), 0.5f);
+            _ball = MakeSphere("ボール(橙)", new Color(1f, 0.6f, 0.1f), 0.7f);
+            _ballGhost = MakeSphere("ボール生位置(赤)", new Color(1f, 0.3f, 0.3f), 0.4f);
 
             if (Camera.main == null)
             {
@@ -133,14 +144,28 @@ namespace SyncLab
                 _seq++;
             }
 
-            // 3. 受信（自分のエコー＝相手に届いた自分の位置）
+            // キック（Space）。ボールに近ければサーバーが蹴る
+            if (_client.Connected && Input.GetKeyDown(KeyCode.Space))
+                _client.Send(MsgKick(_intendedPos));
+
+            // 3. 受信（自分のエコー／ボール）
             while (_client.TryReceive(out var json))
             {
                 SMsg m;
                 try { m = JsonUtility.FromJson<SMsg>(json); } catch { continue; }
-                if (m == null || m.type != "self.echo") continue; // botは無視
-                _rawEchoPos = m.pos.V();
-                _echoBuf.Add(m.t, m.pos.V(), m.vel.V());
+                if (m == null) continue;
+                if (m.type == "self.echo")
+                {
+                    _rawEchoPos = m.pos.V();
+                    _echoBuf.Add(m.t, m.pos.V(), m.vel.V());
+                }
+                else if (m.type == "ball.state")
+                {
+                    _rawBallPos = m.pos.V();
+                    _rawBallVel = m.vel.V();
+                    _ballBuf.Add(m.t, m.pos.V(), m.vel.V());
+                    _lastBallRecvTime = Time.time;
+                }
             }
 
             // 4. 補間クロック
@@ -156,6 +181,17 @@ namespace SyncLab
             Vector3 shadow = interpolate ? _echoBuf.Sample(_interpClockMs, extrapolate) : _rawEchoPos;
             _shadow.position = Lift(shadow, 1f);                          // 緑=相手から見えるあなた
             _rawGhost.position = Lift(_rawEchoPos, 0.5f);                 // 赤=生位置
+
+            // ボール表示（生 / 補間=過去 / 外挿=未来）
+            Vector3 ballShow;
+            switch (ballMode)
+            {
+                case BallMode.Interp: ballShow = _ballBuf.Sample(_interpClockMs, false); break;
+                case BallMode.Extrap: ballShow = _rawBallPos + _rawBallVel * (Time.time - _lastBallRecvTime); break;
+                default: ballShow = _rawBallPos; break;
+            }
+            _ball.position = Lift(ballShow, 0.7f);
+            _ballGhost.position = Lift(_rawBallPos, 0.4f);
         }
 
         private static Vector3 Lift(Vector3 p, float y) => new Vector3(p.x, y, p.z);
@@ -175,6 +211,8 @@ namespace SyncLab
             => $"{{\"type\":\"move\",\"seq\":{seq},\"pos\":{V(pos)},\"vel\":{V(vel)}}}";
         private string MsgConfig(float hz, float lat, float jit, float loss)
             => $"{{\"type\":\"config\",\"authority\":\"client\",\"sendRateHz\":{F(hz)},\"latencyMs\":{F(lat)},\"jitterMs\":{F(jit)},\"lossRate\":{F(loss)}}}";
+        private string MsgKick(Vector3 pos)
+            => $"{{\"type\":\"kick\",\"pos\":{V(pos)}}}";
 
         // ---- UI ----
         private void OnGUI()
@@ -191,7 +229,7 @@ namespace SyncLab
 
             GUILayout.Space(6);
             GUILayout.Label("<b>● 何を見てるか</b>", Rich());
-            GUILayout.Label("<color=#7af>青=あなた（今ここ）</color>\n<color=#7f7>緑=相手の画面に映るあなた</color>\n<color=#f77>赤=補間前の生位置</color>", Rich());
+            GUILayout.Label("<color=#7af>青=あなた（今ここ）</color>\n<color=#7f7>緑=相手の画面に映るあなた</color>\n<color=#fb4>橙=ボール</color> <color=#f77>赤=補間前の生位置</color>", Rich());
 
             GUILayout.Space(6);
             GUILayout.Label($"<b>遅延注入: {injectedLatencyMs:F0} ms（片道）</b>", Rich());
@@ -207,16 +245,27 @@ namespace SyncLab
             GUILayout.Label($"送信レート: {sendRateHz:F0} Hz");
             sendRateHz = GUILayout.HorizontalSlider(sendRateHz, 5, 60);
 
+            GUILayout.Space(6);
+            GUILayout.Label("<b>● ボール（橙）の見せ方</b>", Rich());
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Toggle(ballMode == BallMode.Raw, "生")) ballMode = BallMode.Raw;
+            if (GUILayout.Toggle(ballMode == BallMode.Interp, "補間(過去)")) ballMode = BallMode.Interp;
+            if (GUILayout.Toggle(ballMode == BallMode.Extrap, "外挿(未来)")) ballMode = BallMode.Extrap;
+            GUILayout.EndHorizontal();
+            GUILayout.Label("ボールに近づいて <b>Space</b> で蹴る", Rich());
+
             GUILayout.Space(8);
             GUILayout.Label("<b>● 今おきていること</b>", Rich());
             GUILayout.Label(Explain(), Rich());
 
             GUILayout.Space(8);
             GUILayout.Label("<b>● 試してみて</b>", Rich());
-            GUILayout.Label("WASD/矢印で青を動かす。急にカクッと動かすと緑の遅れが分かる。\n" +
-                            "・遅延を上げる → 緑がもっと遅れる\n" +
-                            "・補間OFF → 緑が赤と同じ（ワープ）\n" +
-                            "・補間ON → 緑が滑らか", Rich());
+            GUILayout.Label("WASD/矢印で青を動かす。Spaceでボールを蹴る。\n" +
+                            "・遅延を上げる → 緑(あなたの分身)が遅れる\n" +
+                            "<b>ボール実験(遅延を150+に):</b>\n" +
+                            "・橙を「補間」に → ボールが赤(生)より遅れる＝過去。当てに行くと外す\n" +
+                            "・橙を「外挿」に → ボールが今ある所に近い＝当てやすい\n" +
+                            "・緑(あなた=過去)と橙(外挿=未来)の<b>時間軸のズレ</b>も見える", Rich());
 
             GUILayout.EndArea();
         }

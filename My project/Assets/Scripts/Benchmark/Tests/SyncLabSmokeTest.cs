@@ -34,25 +34,25 @@ namespace YubiBench.Tests
             SendText(ws, "{\"type\":\"config\",\"authority\":\"client\",\"sendRateHz\":20,\"latencyMs\":0}");
             SendText(ws, "{\"type\":\"move\",\"seq\":1,\"pos\":{\"x\":1,\"y\":0,\"z\":2},\"vel\":{\"x\":0,\"y\":0,\"z\":0}}");
 
-            bool gotBot = false, gotEcho = false;
+            bool gotBall = false, gotEcho = false;
             var buf = new byte[16 * 1024];
             float timeout = 5f;
-            while (timeout > 0 && !(gotBot && gotEcho))
+            while (timeout > 0 && !(gotBall && gotEcho))
             {
                 var recv = ws.ReceiveAsync(new ArraySegment<byte>(buf), CancellationToken.None);
                 float t = 0;
                 while (!recv.IsCompleted && t < 2f) { t += Time.deltaTime; yield return null; }
                 if (!recv.IsCompleted) break;
                 string msg = Encoding.UTF8.GetString(buf, 0, recv.Result.Count);
-                if (msg.Contains("bot.state")) gotBot = true;
+                if (msg.Contains("ball.state")) gotBall = true;
                 if (msg.Contains("self.echo")) gotEcho = true;
                 timeout -= 0.1f;
             }
 
             ws.Dispose();
-            Assert.IsTrue(gotBot, "bot.state を受信できなかった");
+            Assert.IsTrue(gotBall, "ball.state を受信できなかった");
             Assert.IsTrue(gotEcho, "self.echo を受信できなかった");
-            Debug.Log("[SyncLabSmoke] OK: bot.state と self.echo を受信");
+            Debug.Log("[SyncLabSmoke] OK: ball.state と self.echo を受信");
         }
 
         private static void SendText(ClientWebSocket ws, string s)
